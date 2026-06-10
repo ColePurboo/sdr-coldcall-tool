@@ -96,6 +96,21 @@ func (s *SessionState) Resume(logFile string) error {
 	return s.save()
 }
 
+// Retreat moves the session back one company, undoing the last Advance call.
+func (s *SessionState) Retreat(outcome string) error {
+	if s.CurrentPosition > 0 {
+		s.CurrentPosition--
+	}
+	if outcome != "" && s.CallsMade > 0 {
+		s.CallsMade--
+		if s.OutcomeCounts[outcome] > 0 {
+			s.OutcomeCounts[outcome]--
+		}
+	}
+	s.LastActiveAt = time.Now().Format(time.RFC3339)
+	return s.save()
+}
+
 // Complete marks the session as done.
 func (s *SessionState) Complete() error {
 	s.Status = "completed"

@@ -195,4 +195,13 @@ func BuildEntry(
 	}
 }
 
+// RemoveLast removes the most recently appended entry and rewrites the file.
+func (l *Logger) RemoveLast() error {
+	if len(l.logs) == 0 {
+		return nil
+	}
+	l.logs = l.logs[:len(l.logs)-1]
+	return l.flush()
+}
+
 func (l *Logger) Path() string { return l.path }

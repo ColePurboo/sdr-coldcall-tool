@@ -161,15 +161,58 @@ func runLoop(
 	sessionStart := startPos + 1
 	sessionOutcomes := make(map[string]int)
 
-	for i := startPos; i < len(companies); i++ {
+	prefetcher := research.NewPrefetcher(companies, cfg, 3, noResearch)
+	if !noResearch {
+		showResearchLoadingScreen(prefetcher, startPos, companies)
+	}
+
+	// briefCache lets us re-show already-fetched research when going back.
+	briefCache := make(map[int]research.Brief)
+	// calledAt tracks which positions had a call logged and with what outcome,
+	// so we can undo the log entry when the user goes back.
+	calledAt := make(map[int]string)
+
+	for i := startPos; i < len(companies); {
 		co := companies[i]
 		position := i + 1
 
-		result, _ := dialer.RunCard(co, 0, position, total, csvDisplayName, cfg, noResearch)
+		var ch chan research.Brief
+		if cached, ok := briefCache[i]; ok {
+			ch = make(chan research.Brief, 1)
+			ch <- cached
+		} else {
+			ch = prefetcher.Chan(i)
+		}
+
+		result, _ := dialer.RunCard(co, 0, position, total, csvDisplayName, ch, i > startPos)
+
+		// Cache the brief so going back can re-display it instantly.
+		if result.Brief.WhatTheyDo != "" || result.Brief.Raw != "" {
+			briefCache[i] = result.Brief
+		}
 
 		if result.Quit {
 			printQuitSummary(csvDisplayName, sess, sessionCalls, sessionStart, i+1, sessionOutcomes, log.Path())
 			return
+		}
+
+		if result.Back {
+			// Going back: remove the previous company's log entry if it was a real call.
+			prev := i - 1
+			if outcome, called := calledAt[prev]; called {
+				if err := log.RemoveLast(); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not remove log entry: %v\n", err)
+				}
+				_ = sess.Retreat(outcome)
+				sessionCalls--
+				sessionOutcomes[outcome]--
+				delete(calledAt, prev)
+			} else {
+				// Previous company was skipped — still need to retreat the position counter.
+				_ = sess.Retreat("")
+			}
+			i--
+			continue
 		}
 
 		outcome := ""
@@ -189,6 +232,7 @@ func runLoop(
 		}
 
 		if result.Skipped {
+			i++
 			continue
 		}
 
@@ -208,8 +252,10 @@ func runLoop(
 			fmt.Fprintf(os.Stderr, "Warning: could not write log: %v\n", err)
 		}
 
+		calledAt[i] = result.Outcome
 		sessionCalls++
 		sessionOutcomes[result.Outcome]++
+		i++
 	}
 
 	// Completed
@@ -220,6 +266,40 @@ func runLoop(
 		session.RenameCSV(stripped, "[completed] ")
 	}
 	printCompleteSummary(csvDisplayName, sess, sessionCalls, sessionStart, len(companies), sessionOutcomes, log.Path())
+}
+
+// showResearchLoadingScreen warms the prefetch window and blocks until the
+// first company's research is ready, showing a live progress spinner.
+// It replaces the consumed channel so the main loop can read it normally.
+func showResearchLoadingScreen(pf *research.Prefetcher, startPos int, companies []*leads.Company) {
+	ch := pf.Chan(startPos) // kicks off up to 7 goroutines
+	warmCount := pf.WarmCount(startPos)
+	name := companies[startPos].Name
+
+	fmt.Printf("\n  Prefetching research for next %d companies...\n\n", warmCount)
+
+	spinner := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	frame := 0
+	ticker := time.NewTicker(120 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case brief := <-ch:
+			fmt.Printf("\r  ✓  Research ready — starting dial session%s\n\n",
+				strings.Repeat(" ", 20))
+			// Restore the result so the main loop's RunCard call can read it.
+			refilled := make(chan research.Brief, 1)
+			refilled <- brief
+			pf.Set(startPos, refilled)
+			return
+		case <-ticker.C:
+			done := pf.DoneCount()
+			fmt.Printf("\r  %s  %-32s [%d/%d ready]",
+				spinner[frame%len(spinner)], name, done, warmCount)
+			frame++
+		}
+	}
 }
 
 func displayName(csvPath string) string {

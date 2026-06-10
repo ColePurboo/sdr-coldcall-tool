@@ -9,7 +9,6 @@ import (
 
 	"golang.org/x/term"
 
-	"sdr-dialer/config"
 	"sdr-dialer/leads"
 	"sdr-dialer/research"
 	"sdr-dialer/session"
@@ -89,25 +88,20 @@ type CallResult struct {
 	End      time.Time
 	Skipped  bool
 	Quit     bool
+	Back     bool // go to previous company
 }
 
 // RunCard displays one company card and drives the call interaction.
+// researchCh must be a buffered channel (cap 1) with research already in flight.
+// hasPrevious indicates whether a previous company exists to go back to.
 func RunCard(
 	co *leads.Company,
 	contactIdx int,
 	position, total int,
 	csvDisplayName string,
-	cfg *config.Config,
-	noResearch bool,
+	researchCh chan research.Brief,
+	hasPrevious bool,
 ) (CallResult, int) {
-	// Start research in background
-	researchCh := make(chan research.Brief, 1)
-	if !noResearch {
-		go research.Run(co, cfg, researchCh)
-	} else {
-		researchCh <- research.Brief{}
-	}
-
 	// Separator between company cards (no full clear — SDR can scroll up)
 	fmt.Print("\n\n")
 	fmt.Println(barSep)
@@ -150,15 +144,17 @@ func RunCard(
 		fmt.Printf("  WEBSITE   %s\n", websiteLink(co.Website))
 	}
 
-	// Research section
+	// Research section — try to show immediately if prefetch already landed
 	fmt.Println("\n  ─ RESEARCH ────────────────────────────────────────")
 	var brief research.Brief
+	briefFetched := false
 	select {
 	case brief = <-researchCh:
+		briefFetched = true
 		printBrief(brief)
 	default:
 		fmt.Println("  ⟳  Researching " + co.Name + "...")
-		fmt.Println("     (press ENTER to skip and go straight to call)")
+		fmt.Println("     (press ENTER to check again or go straight to call)")
 	}
 	fmt.Println("  ────────────────────────────────────────────────────")
 
@@ -167,7 +163,14 @@ func RunCard(
 	if len(co.Contacts) > 1 {
 		extra = "    n  Next contact"
 	}
-	fmt.Printf("\n  c  Call    s  Skip%s    q  Quit\n\n  Press c, s, n, or q:\n> ", extra)
+	back := ""
+	if hasPrevious {
+		back = "    b  Back"
+	}
+	printPrompt := func() {
+		fmt.Printf("\n  c  Call    s  Skip%s%s    q  Quit\n\n  Press a key:\n> ", extra, back)
+	}
+	printPrompt()
 
 	for {
 		key, err := ReadKey()
@@ -177,48 +180,71 @@ func RunCard(
 
 		switch key {
 		case 'c', 'C':
-			// Wait for research if not yet arrived
-			select {
-			case brief = <-researchCh:
-			default:
+			if !briefFetched {
 				select {
 				case brief = <-researchCh:
-				case <-time.After(200 * time.Millisecond):
-					fmt.Println("\n  ⟳  Loading research... (press ENTER to skip)")
-					doneCh := make(chan struct{})
-					go func() { readLine(); close(doneCh) }()
+					briefFetched = true
+				default:
 					select {
 					case brief = <-researchCh:
-					case <-doneCh:
+						briefFetched = true
+					case <-time.After(200 * time.Millisecond):
+						fmt.Println("\n  ⟳  Loading research... (press ENTER to skip)")
+						doneCh := make(chan struct{})
+						go func() { readLine(); close(doneCh) }()
+						select {
+						case brief = <-researchCh:
+							briefFetched = true
+						case <-doneCh:
+						}
 					}
 				}
 			}
-			result, cidx := doCall(contact, phone, co, brief)
+			result, cidx, aborted := doCall(contact, phone, co, brief)
+			if aborted {
+				fmt.Println("\n  ← Call cancelled.")
+				printPrompt()
+				continue
+			}
 			result.Brief = brief
 			return result, cidx
 
 		case 's', 'S':
 			fmt.Println()
-			go func() { <-researchCh }()
 			return CallResult{Skipped: true}, contactIdx
+
+		case 'b', 'B':
+			if hasPrevious {
+				fmt.Println()
+				return CallResult{Back: true}, contactIdx
+			}
 
 		case 'n', 'N':
 			if len(co.Contacts) > 1 {
 				next := (contactIdx + 1) % len(co.Contacts)
-				go func() { <-researchCh }()
-				return RunCard(co, next, position, total, csvDisplayName, cfg, noResearch)
+				var ch chan research.Brief
+				if briefFetched {
+					ch = make(chan research.Brief, 1)
+					ch <- brief
+				} else {
+					ch = researchCh
+				}
+				return RunCard(co, next, position, total, csvDisplayName, ch, hasPrevious)
 			}
 
 		case 'q', 'Q', 3:
-			go func() { <-researchCh }()
 			return CallResult{Quit: true}, contactIdx
 
 		case '\r', '\n':
-			select {
-			case brief = <-researchCh:
-				printBrief(brief)
-				fmt.Println("  ────────────────────────────────────────────────────")
-			default:
+			if !briefFetched {
+				select {
+				case brief = <-researchCh:
+					briefFetched = true
+					printBrief(brief)
+					fmt.Println("  ────────────────────────────────────────────────────")
+					printPrompt()
+				default:
+				}
 			}
 		}
 	}
@@ -250,7 +276,9 @@ func printBrief(brief research.Brief) {
 	}
 }
 
-func doCall(contact leads.Contact, phone string, co *leads.Company, brief research.Brief) (CallResult, int) {
+// doCall runs the call flow. Returns (result, contactIdx, aborted).
+// aborted=true means the user pressed back mid-flow; no call was logged.
+func doCall(contact leads.Contact, phone string, co *leads.Company, brief research.Brief) (CallResult, int, bool) {
 	fmt.Printf("\n  ─ CALLING ──────────────────────────────────────────\n")
 	if phone != "" && phone != "—" {
 		fmt.Printf("  ⟳  Dialing %s...\n", phone)
@@ -259,18 +287,29 @@ func doCall(contact leads.Contact, phone string, co *leads.Company, brief resear
 	}
 	fmt.Println("     (Aircall not configured — simulating call)")
 	fmt.Println("\n  ↵  Press ENTER when the call is finished to log the outcome.")
+	fmt.Println("  b  Back to card (cancel this call)")
 	fmt.Println("  ─────────────────────────────────────────────────────")
 
 	callStart := time.Now()
 	readLine()
 	callEnd := time.Now()
 
-	outcome := promptOutcome()
-	if outcome == "" {
-		return CallResult{Quit: true}, 0
-	}
+	var outcome, tag string
+	for {
+		outcome = promptOutcome()
+		if outcome == "" {
+			return CallResult{Quit: true}, 0, false
+		}
+		if outcome == "back" {
+			return CallResult{}, 0, true
+		}
 
-	tag := promptTag(outcome)
+		tag = promptTag(outcome)
+		if tag == "back" {
+			continue // re-prompt outcome
+		}
+		break
+	}
 
 	fmt.Println("\n  ─ NOTES ────────────────────────────────────────────")
 	fmt.Println("  Any notes from the call? (optional)")
@@ -291,9 +330,10 @@ func doCall(contact leads.Contact, phone string, co *leads.Company, brief resear
 		Brief:    brief,
 		Start:    callStart,
 		End:      callEnd,
-	}, 0
+	}, 0, false
 }
 
+// promptOutcome returns an outcome string, "" to quit, or "back" to cancel the call.
 func promptOutcome() string {
 	fmt.Println("\n  ─ OUTCOME ──────────────────────────────────────────")
 	fmt.Print("  How did the call go?\n\n")
@@ -302,6 +342,7 @@ func promptOutcome() string {
 	fmt.Println("  3  No answer")
 	fmt.Println("  4  Not interested")
 	fmt.Println("  5  Wrong number / bad data")
+	fmt.Println("\n  b  Back to card   q  Quit")
 	fmt.Println("\n  Press 1–5:")
 	fmt.Print("> ")
 
@@ -314,8 +355,12 @@ func promptOutcome() string {
 	}
 	for {
 		key, err := ReadKey()
-		if err != nil || key == 'q' || key == 3 {
+		if err != nil || key == 'q' || key == 'Q' || key == 3 {
 			return ""
+		}
+		if key == 'b' || key == 'B' {
+			fmt.Println()
+			return "back"
 		}
 		if o, ok := outcomes[key]; ok {
 			fmt.Println(string(key))
@@ -340,6 +385,7 @@ var tagPrompts = map[string]string{
 	"wrong_number":   "What was wrong?",
 }
 
+// promptTag returns a tag string, "" for no tag, or "back" to re-prompt outcome.
 func promptTag(outcome string) string {
 	options := tagOptions[outcome]
 	if len(options) == 0 {
@@ -352,13 +398,18 @@ func promptTag(outcome string) string {
 	for i, opt := range options {
 		fmt.Printf("  %d  %s\n", i+1, opt)
 	}
-	fmt.Printf("\n  Press 1–%d:\n", len(options))
+	fmt.Printf("\n  b  Back to outcome")
+	fmt.Printf("\n\n  Press 1–%d:\n", len(options))
 	fmt.Print("> ")
 
 	for {
 		key, err := ReadKey()
 		if err != nil {
 			return ""
+		}
+		if key == 'b' || key == 'B' {
+			fmt.Println()
+			return "back"
 		}
 		idx := int(key - '1')
 		if idx >= 0 && idx < len(options) {

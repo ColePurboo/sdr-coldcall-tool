@@ -7,8 +7,9 @@ A local Go CLI tool for SDR cold calling. Loads a CSV of prospects, groups them 
 ## What it does
 
 - Groups CSV rows by company, picks the best contact by title tier (CEO > COO > Manager > Accountant)
-- Runs async research while you read the card — no waiting
+- Prefetches research for the next 3 companies in the background — brief is ready before you get there
 - Single-keystroke call outcomes and tags
+- **Back button on every screen** — go back to the previous company and redo the call; log entry is edited automatically
 - Saves progress automatically — quit any time, resume exactly where you left off
 - Outputs structured JSON logs ready for HubSpot import
 
@@ -17,7 +18,7 @@ A local Go CLI tool for SDR cold calling. Loads a CSV of prospects, groups them 
 ## Requirements
 
 - **Go 1.21+** — [download here](https://go.dev/dl/)
-- **Anthropic API key** — for AI research briefs
+- **Anthropic API key** — for AI research briefs (uses Claude Haiku 4.5)
 - **Browserless token** — for website scraping ([browserless.io](https://www.browserless.io))
 
 ---
@@ -109,15 +110,19 @@ Loads and prints the full company list — no calls, no API requests, no log fil
 ## Daily Workflow
 
 1. Run `./sdr` and select your list from the menu
-2. For each company:
-   - Read the research brief (loads while you read)
-   - Press **c** to call, **s** to skip, **n** for next contact, **q** to quit
+2. A loading screen prefetches research for the first 3 companies — you start with the brief already there
+3. For each company:
+   - Read the research brief (already loaded for upcoming companies)
+   - Press **c** to call, **s** to skip, **n** for next contact, **b** to go back, **q** to quit
    - Press **ENTER** when the call ends
    - Press **1–5** for the outcome (Interested / Voicemail / No answer / Not interested / Wrong number)
-   - Press a number for the follow-up tag
+   - Press **b** at the outcome or tag screen to cancel back to the card
+   - Press **b** at the tag screen to re-pick the outcome
    - Type any notes and press **ENTER** (or just ENTER to skip)
-3. Press **q** at any time — your position saves automatically
-4. Run `./sdr` again and select the `[in progress]` list to resume
+4. Press **q** at any time — your position saves automatically
+5. Run `./sdr` again and select the `[in progress]` list to resume
+
+**Going back** — pressing **b** on any card returns you to the previous company. If that company already had a call logged, the log entry is removed so you can redo it cleanly.
 
 ---
 

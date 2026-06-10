@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"sdr-dialer/config"
@@ -30,6 +32,86 @@ func Run(co *leads.Company, cfg *config.Config, ch chan<- Brief) {
 	webSearch := claudeWebSearch(co, cfg.AnthropicAPIKey)
 	brief := claudeReason(co, scraped, webSearch, cfg.AnthropicAPIKey)
 	ch <- brief
+}
+
+// Prefetcher keeps a sliding window of in-flight research goroutines so results
+// are ready before the user reaches each company.
+type Prefetcher struct {
+	companies     []*leads.Company
+	cfg           *config.Config
+	ahead         int
+	noResearch    bool
+	mu            sync.Mutex
+	channels      map[int]chan Brief
+	doneCount     int32      // atomic: incremented when each goroutine finishes
+	browserlessMu sync.Mutex // serializes Browserless API calls (one at a time)
+}
+
+func NewPrefetcher(companies []*leads.Company, cfg *config.Config, ahead int, noResearch bool) *Prefetcher {
+	return &Prefetcher{
+		companies:  companies,
+		cfg:        cfg,
+		ahead:      ahead,
+		noResearch: noResearch,
+		channels:   make(map[int]chan Brief),
+	}
+}
+
+// Chan returns the result channel for index i, starting it and the lookahead
+// window if not already running. Safe to call concurrently.
+func (p *Prefetcher) Chan(i int) chan Brief {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	end := i + p.ahead
+	if end > len(p.companies) {
+		end = len(p.companies)
+	}
+	for idx := i; idx < end; idx++ {
+		if _, exists := p.channels[idx]; !exists {
+			ch := make(chan Brief, 1)
+			p.channels[idx] = ch
+			if p.noResearch {
+				ch <- Brief{}
+				atomic.AddInt32(&p.doneCount, 1)
+			} else {
+				co := p.companies[idx]
+				go func(co *leads.Company, ch chan Brief) {
+					// Browserless: one scrape at a time.
+					p.browserlessMu.Lock()
+					scraped := scrapeWebsite(co.Website, p.cfg.BrowserlessToken)
+					p.browserlessMu.Unlock()
+					// Claude calls run in parallel; browserless mutex staggers them ~8s apart.
+					webSearch := claudeWebSearch(co, p.cfg.AnthropicAPIKey)
+					brief := claudeReason(co, scraped, webSearch, p.cfg.AnthropicAPIKey)
+					ch <- brief
+					atomic.AddInt32(&p.doneCount, 1)
+				}(co, ch)
+			}
+		}
+	}
+	return p.channels[i]
+}
+
+// Set replaces the channel for index i (used after consuming a result from the
+// loading screen to restore it for the main loop).
+func (p *Prefetcher) Set(i int, ch chan Brief) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.channels[i] = ch
+}
+
+// DoneCount returns how many research goroutines have completed so far.
+func (p *Prefetcher) DoneCount() int {
+	return int(atomic.LoadInt32(&p.doneCount))
+}
+
+// WarmCount returns how many goroutines will be started for the window beginning at from.
+func (p *Prefetcher) WarmCount(from int) int {
+	end := from + p.ahead
+	if end > len(p.companies) {
+		end = len(p.companies)
+	}
+	return end - from
 }
 
 // --- Step A: Browserless scrape ---
@@ -127,46 +209,58 @@ type anthropicResponse struct {
 func claudePost(payload anthropicRequest, apiKey string, timeout time.Duration) (string, error) {
 	body, _ := json.Marshal(payload)
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("anthropic-beta", "web-search-2025-03-05")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("anthropic API %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var ar anthropicResponse
-	if err := json.Unmarshal(respBody, &ar); err != nil {
-		return "", err
-	}
-
-	var sb strings.Builder
-	for _, c := range ar.Content {
-		if c.Type == "text" && c.Text != "" {
-			sb.WriteString(c.Text)
+	delays := []time.Duration{30 * time.Second, 60 * time.Second, 90 * time.Second}
+	for attempt := 0; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			"https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+		if err != nil {
+			cancel()
+			return "", err
 		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", apiKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("anthropic-beta", "web-search-2025-03-05")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			cancel()
+			return "", err
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		cancel()
+
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < len(delays) {
+			// Honour the server's reset timestamp if present, otherwise use backoff.
+			wait := delays[attempt]
+			if reset := resp.Header.Get("anthropic-ratelimit-input-tokens-reset"); reset != "" {
+				if t, err := time.Parse(time.RFC3339, reset); err == nil {
+					if d := time.Until(t) + time.Second; d > wait {
+						wait = d
+					}
+				}
+			}
+			time.Sleep(wait)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("anthropic API %d: %s", resp.StatusCode, string(respBody))
+		}
+
+		var ar anthropicResponse
+		if err := json.Unmarshal(respBody, &ar); err != nil {
+			return "", err
+		}
+		var sb strings.Builder
+		for _, c := range ar.Content {
+			if c.Type == "text" && c.Text != "" {
+				sb.WriteString(c.Text)
+			}
+		}
+		return sb.String(), nil
 	}
-	return sb.String(), nil
 }
 
 func claudeWebSearch(co *leads.Company, apiKey string) string {
@@ -183,7 +277,7 @@ func claudeWebSearch(co *leads.Company, apiKey string) string {
 	)
 
 	result, err := claudePost(anthropicRequest{
-		Model:     "claude-sonnet-4-6",
+		Model:     "claude-haiku-4-5-20251001",
 		MaxTokens: 500,
 		Tools:     []anthropicTool{{Type: "web_search_20250305", Name: "web_search"}},
 		Messages:  []anthropicMessage{{Role: "user", Content: []anthropicContent{{Type: "text", Text: prompt}}}},
@@ -253,7 +347,7 @@ Return only valid JSON. No preamble, no markdown.`,
 	)
 
 	result, err := claudePost(anthropicRequest{
-		Model:     "claude-sonnet-4-6",
+		Model:     "claude-haiku-4-5-20251001",
 		MaxTokens: 600,
 		System:    systemPrompt,
 		Messages:  []anthropicMessage{{Role: "user", Content: []anthropicContent{{Type: "text", Text: userPrompt}}}},
