@@ -1,0 +1,26 @@
+# API keys — never commit
+.env
+
+# Compiled binary
+sdr
+sdr.exe
+
+# Call logs (contain prospect data)
+logs/
+
+# Session state files
+.sessions/
+
+# Lead list CSVs (contain prospect data)
+*.csv
+
+# Go build artifacts
+*.test
+*.out
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
