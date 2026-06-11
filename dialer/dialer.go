@@ -287,16 +287,13 @@ func doCall(contact leads.Contact, phone string, co *leads.Company, brief resear
 
 	if cfg != nil && cfg.IsAircallConfigured() && phone != "" && phone != "—" {
 		fmt.Printf("  ⟳  Dialing %s via Aircall...\n", phone)
-		callID, err := dialAircall(cfg, phone)
-		if err != nil {
+		if err := dialAircall(cfg, phone); err != nil {
 			fmt.Printf("\n  ✗  %s\n", err)
 			fmt.Println("     Press ENTER to continue anyway, or type 'b' + ENTER to cancel.")
 			fmt.Print("> ")
 			if line := readLine(); line == "b" || line == "B" {
 				return CallResult{}, 0, true
 			}
-		} else if callID != 0 {
-			fmt.Printf("  ✓  Aircall connected (call #%d) — your softphone should be ringing.\n", callID)
 		} else {
 			fmt.Println("  ✓  Aircall dial initiated — your softphone should be ringing.")
 		}

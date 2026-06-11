@@ -48,5 +48,5 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) IsAircallConfigured() bool {
-	return c.AircallAPIID != "" && c.AircallAPIToken != "" && c.AircallNumberID != ""
+	return c.AircallAPIID != "" && c.AircallAPIToken != "" && c.AircallNumberID != "" && c.AircallUserID != ""
 }
