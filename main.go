@@ -184,7 +184,7 @@ func runLoop(
 			ch = prefetcher.Chan(i)
 		}
 
-		result, _ := dialer.RunCard(co, 0, position, total, csvDisplayName, ch, i > startPos)
+		result, _ := dialer.RunCard(co, 0, position, total, csvDisplayName, ch, i > startPos, cfg)
 
 		// Cache the brief so going back can re-display it instantly.
 		if result.Brief.WhatTheyDo != "" || result.Brief.Raw != "" {

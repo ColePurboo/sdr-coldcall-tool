@@ -12,6 +12,8 @@ type Config struct {
 	BrowserlessToken string
 	AircallAPIID     string
 	AircallAPIToken  string
+	AircallNumberID  string
+	AircallUserID    string
 }
 
 func Load() (*Config, error) {
@@ -23,6 +25,8 @@ func Load() (*Config, error) {
 		BrowserlessToken: os.Getenv("BROWSERLESS_TOKEN"),
 		AircallAPIID:     os.Getenv("AIRCALL_API_ID"),
 		AircallAPIToken:  os.Getenv("AIRCALL_API_TOKEN"),
+		AircallNumberID:  os.Getenv("AIRCALL_NUMBER_ID"),
+		AircallUserID:    os.Getenv("AIRCALL_USER_ID"),
 	}
 
 	var missing []string
@@ -41,4 +45,8 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func (c *Config) IsAircallConfigured() bool {
+	return c.AircallAPIID != "" && c.AircallAPIToken != "" && c.AircallNumberID != ""
 }

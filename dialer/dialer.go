@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/term"
 
+	"sdr-dialer/config"
 	"sdr-dialer/leads"
 	"sdr-dialer/research"
 	"sdr-dialer/session"
@@ -101,6 +102,7 @@ func RunCard(
 	csvDisplayName string,
 	researchCh chan research.Brief,
 	hasPrevious bool,
+	cfg *config.Config,
 ) (CallResult, int) {
 	// Separator between company cards (no full clear — SDR can scroll up)
 	fmt.Print("\n\n")
@@ -200,7 +202,7 @@ func RunCard(
 					}
 				}
 			}
-			result, cidx, aborted := doCall(contact, phone, co, brief)
+			result, cidx, aborted := doCall(contact, phone, co, brief, cfg)
 			if aborted {
 				fmt.Println("\n  ← Call cancelled.")
 				printPrompt()
@@ -229,7 +231,7 @@ func RunCard(
 				} else {
 					ch = researchCh
 				}
-				return RunCard(co, next, position, total, csvDisplayName, ch, hasPrevious)
+				return RunCard(co, next, position, total, csvDisplayName, ch, hasPrevious, cfg)
 			}
 
 		case 'q', 'Q', 3:
@@ -278,19 +280,39 @@ func printBrief(brief research.Brief) {
 
 // doCall runs the call flow. Returns (result, contactIdx, aborted).
 // aborted=true means the user pressed back mid-flow; no call was logged.
-func doCall(contact leads.Contact, phone string, co *leads.Company, brief research.Brief) (CallResult, int, bool) {
+func doCall(contact leads.Contact, phone string, co *leads.Company, brief research.Brief, cfg *config.Config) (CallResult, int, bool) {
 	fmt.Printf("\n  ─ CALLING ──────────────────────────────────────────\n")
-	if phone != "" && phone != "—" {
-		fmt.Printf("  ⟳  Dialing %s...\n", phone)
+
+	callStart := time.Now()
+
+	if cfg != nil && cfg.IsAircallConfigured() && phone != "" && phone != "—" {
+		fmt.Printf("  ⟳  Dialing %s via Aircall...\n", phone)
+		callID, err := dialAircall(cfg, phone)
+		if err != nil {
+			fmt.Printf("\n  ✗  %s\n", err)
+			fmt.Println("     Press ENTER to continue anyway, or type 'b' + ENTER to cancel.")
+			fmt.Print("> ")
+			if line := readLine(); line == "b" || line == "B" {
+				return CallResult{}, 0, true
+			}
+		} else if callID != 0 {
+			fmt.Printf("  ✓  Aircall connected (call #%d) — your softphone should be ringing.\n", callID)
+		} else {
+			fmt.Println("  ✓  Aircall dial initiated — your softphone should be ringing.")
+		}
 	} else {
-		fmt.Printf("  ⟳  Calling %s...\n", co.Name)
+		if phone != "" && phone != "—" {
+			fmt.Printf("  ⟳  Dialing %s...\n", phone)
+		} else {
+			fmt.Printf("  ⟳  Calling %s...\n", co.Name)
+		}
+		fmt.Println("     (Aircall not configured — simulating call)")
 	}
-	fmt.Println("     (Aircall not configured — simulating call)")
+
 	fmt.Println("\n  ↵  Press ENTER when the call is finished to log the outcome.")
 	fmt.Println("  b  Back to card (cancel this call)")
 	fmt.Println("  ─────────────────────────────────────────────────────")
 
-	callStart := time.Now()
 	readLine()
 	callEnd := time.Now()
 
