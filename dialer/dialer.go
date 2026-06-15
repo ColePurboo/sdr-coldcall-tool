@@ -103,6 +103,7 @@ func RunCard(
 	researchCh chan research.Brief,
 	hasPrevious bool,
 	cfg *config.Config,
+	noAircall bool,
 ) (CallResult, int) {
 	// Separator between company cards (no full clear — SDR can scroll up)
 	fmt.Print("\n\n")
@@ -202,7 +203,7 @@ func RunCard(
 					}
 				}
 			}
-			result, cidx, aborted := doCall(phone, co, brief, cfg)
+			result, cidx, aborted := doCall(phone, co, brief, cfg, noAircall)
 			if aborted {
 				fmt.Println("\n  ← Call cancelled.")
 				printPrompt()
@@ -231,7 +232,7 @@ func RunCard(
 				} else {
 					ch = researchCh
 				}
-				return RunCard(co, next, position, total, csvDisplayName, ch, hasPrevious, cfg)
+				return RunCard(co, next, position, total, csvDisplayName, ch, hasPrevious, cfg, noAircall)
 			}
 
 		case 'q', 'Q', 3:
@@ -280,12 +281,12 @@ func printBrief(brief research.Brief) {
 
 // doCall runs the call flow. Returns (result, contactIdx, aborted).
 // aborted=true means the user pressed back mid-flow; no call was logged.
-func doCall(phone string, co *leads.Company, brief research.Brief, cfg *config.Config) (CallResult, int, bool) {
+func doCall(phone string, co *leads.Company, brief research.Brief, cfg *config.Config, noAircall bool) (CallResult, int, bool) {
 	fmt.Printf("\n  ─ CALLING ──────────────────────────────────────────\n")
 
 	callStart := time.Now()
 
-	if cfg != nil && cfg.IsAircallConfigured() && phone != "" && phone != "—" {
+	if !noAircall && cfg != nil && cfg.IsAircallConfigured() && phone != "" && phone != "—" {
 		fmt.Printf("  ⟳  Dialing %s via Aircall...\n", phone)
 		if err := dialAircall(cfg, phone); err != nil {
 			fmt.Printf("\n  ✗  %s\n", err)

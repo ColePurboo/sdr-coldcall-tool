@@ -24,6 +24,7 @@ func main() {
 	fileFlag := flag.String("file", "", "Path to specific CSV (skips selection menu)")
 	dryRun := flag.Bool("dry-run", false, "Load and display companies, no calls, no API requests")
 	noResearch := flag.Bool("no-research", false, "Skip research pipeline")
+	noAircall := flag.Bool("no-aircall", false, "Skip Aircall dialing (simulate calls instead)")
 	researchOnly := flag.Bool("research-only", false, "Run research on first company and print, then exit")
 	fromFlag := flag.Int("from", 0, "Start from company number N (1-indexed)")
 	freshFlag := flag.Bool("fresh", false, "Ignore saved session and start from beginning")
@@ -162,7 +163,7 @@ func main() {
 				_ = existing.Resume(log.Path())
 				sess = existing
 				sess.CSVPath = csvPath
-				runLoop(companies, startPos, total, csvPath, csvDisplayName, cfg, *noResearch, log, sess, postCall)
+				runLoop(companies, startPos, total, csvPath, csvDisplayName, cfg, *noResearch, *noAircall, log, sess, postCall)
 				return
 			case "s":
 				_ = existing.Delete()
@@ -196,7 +197,7 @@ func main() {
 		}
 	}
 
-	runLoop(companies, startPos, total, csvPath, csvDisplayName, cfg, *noResearch, log, sess, postCall)
+	runLoop(companies, startPos, total, csvPath, csvDisplayName, cfg, *noResearch, *noAircall, log, sess, postCall)
 }
 
 func runLoop(
@@ -205,6 +206,7 @@ func runLoop(
 	csvPath, csvDisplayName string,
 	cfg *config.Config,
 	noResearch bool,
+	noAircall bool,
 	log *logger.Logger,
 	sess *session.SessionState,
 	postCall postCallFn,
@@ -237,7 +239,7 @@ func runLoop(
 			ch = prefetcher.Chan(i)
 		}
 
-		result, _ := dialer.RunCard(co, 0, position, total, csvDisplayName, ch, i > startPos, cfg)
+		result, _ := dialer.RunCard(co, 0, position, total, csvDisplayName, ch, i > startPos, cfg, noAircall)
 
 		// Cache the brief so going back can re-display it instantly.
 		if result.Brief.WhatTheyDo != "" || result.Brief.Raw != "" {
