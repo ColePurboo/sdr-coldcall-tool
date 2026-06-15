@@ -81,15 +81,15 @@ func wordWrap(s string, width int, indent string) string {
 
 // CallResult holds everything captured during one company interaction.
 type CallResult struct {
-	Outcome  string
-	QuickTag string
-	FreeText string
-	Brief    research.Brief
-	Start    time.Time
-	End      time.Time
-	Skipped  bool
-	Quit     bool
-	Back     bool // go to previous company
+	Disposition string
+	Sentiment   string // only set when Disposition == "connected_dm"
+	FreeText    string
+	Brief       research.Brief
+	Start       time.Time
+	End         time.Time
+	Skipped     bool
+	Quit        bool
+	Back        bool // go to previous company
 }
 
 // RunCard displays one company card and drives the call interaction.
@@ -202,7 +202,7 @@ func RunCard(
 					}
 				}
 			}
-			result, cidx, aborted := doCall(contact, phone, co, brief, cfg)
+			result, cidx, aborted := doCall(phone, co, brief, cfg)
 			if aborted {
 				fmt.Println("\n  ← Call cancelled.")
 				printPrompt()
@@ -280,7 +280,7 @@ func printBrief(brief research.Brief) {
 
 // doCall runs the call flow. Returns (result, contactIdx, aborted).
 // aborted=true means the user pressed back mid-flow; no call was logged.
-func doCall(contact leads.Contact, phone string, co *leads.Company, brief research.Brief, cfg *config.Config) (CallResult, int, bool) {
+func doCall(phone string, co *leads.Company, brief research.Brief, cfg *config.Config) (CallResult, int, bool) {
 	fmt.Printf("\n  ─ CALLING ──────────────────────────────────────────\n")
 
 	callStart := time.Now()
@@ -313,19 +313,21 @@ func doCall(contact leads.Contact, phone string, co *leads.Company, brief resear
 	readLine()
 	callEnd := time.Now()
 
-	var outcome, tag string
+	var disposition, sentiment string
 	for {
-		outcome = promptOutcome()
-		if outcome == "" {
+		disposition = promptDisposition()
+		if disposition == "" {
 			return CallResult{Quit: true}, 0, false
 		}
-		if outcome == "back" {
+		if disposition == "back" {
 			return CallResult{}, 0, true
 		}
 
-		tag = promptTag(outcome)
-		if tag == "back" {
-			continue // re-prompt outcome
+		if disposition == "connected_dm" {
+			sentiment = promptSentiment()
+			if sentiment == "back" {
+				continue // re-prompt disposition
+			}
 		}
 		break
 	}
@@ -343,34 +345,40 @@ func doCall(contact leads.Contact, phone string, co *leads.Company, brief resear
 	readLine()
 
 	return CallResult{
-		Outcome:  outcome,
-		QuickTag: tag,
-		FreeText: freeText,
-		Brief:    brief,
-		Start:    callStart,
-		End:      callEnd,
+		Disposition: disposition,
+		Sentiment:   sentiment,
+		FreeText:    freeText,
+		Brief:       brief,
+		Start:       callStart,
+		End:         callEnd,
 	}, 0, false
 }
 
-// promptOutcome returns an outcome string, "" to quit, or "back" to cancel the call.
-func promptOutcome() string {
-	fmt.Println("\n  ─ OUTCOME ──────────────────────────────────────────")
+// promptDisposition returns a disposition key, "" to quit, or "back" to cancel the call.
+func promptDisposition() string {
+	fmt.Println("\n  ─ DISPOSITION ──────────────────────────────────────")
 	fmt.Print("  How did the call go?\n\n")
-	fmt.Println("  1  Interested")
-	fmt.Println("  2  Voicemail")
-	fmt.Println("  3  No answer")
-	fmt.Println("  4  Not interested")
-	fmt.Println("  5  Wrong number / bad data")
+	fmt.Println("  1  No Answer")
+	fmt.Println("  2  Number not in service")
+	fmt.Println("  3  Contact retired")
+	fmt.Println("  4  Instant hangup w/DM")
+	fmt.Println("  5  Connected w/DM")
+	fmt.Println("  6  Connected w/Reception")
+	fmt.Println("  7  Need to enrich")
+	fmt.Println("  8  Other")
 	fmt.Println("\n  b  Back to card   q  Quit")
-	fmt.Println("\n  Press 1–5:")
+	fmt.Println("\n  Press 1–8:")
 	fmt.Print("> ")
 
-	outcomes := map[byte]string{
-		'1': "interested",
-		'2': "voicemail",
-		'3': "no_answer",
-		'4': "not_interested",
-		'5': "wrong_number",
+	dispositions := map[byte]string{
+		'1': "no_answer",
+		'2': "number_not_in_service",
+		'3': "contact_retired",
+		'4': "instant_hangup_dm",
+		'5': "connected_dm",
+		'6': "connected_reception",
+		'7': "need_to_enrich",
+		'8': "other",
 	}
 	for {
 		key, err := ReadKey()
@@ -381,63 +389,58 @@ func promptOutcome() string {
 			fmt.Println()
 			return "back"
 		}
-		if o, ok := outcomes[key]; ok {
+		if d, ok := dispositions[key]; ok {
 			fmt.Println(string(key))
-			return o
+			return d
 		}
 	}
 }
 
-var tagOptions = map[string][]string{
-	"interested":     {"Send follow-up email", "Book demo", "Send pricing info", "No tag"},
-	"voicemail":      {"Left message", "No message — will try again", "No tag"},
-	"no_answer":      {"Will try again later", "Try different number", "No tag"},
-	"not_interested": {"Has existing solution", "Too small / not a fit", "Wrong person", "No tag"},
-	"wrong_number":   {"Number disconnected", "Reached different company", "No tag"},
-}
-
-var tagPrompts = map[string]string{
-	"interested":     "What's the next step?",
-	"voicemail":      "What happened?",
-	"no_answer":      "What's the plan?",
-	"not_interested": "Why not?",
-	"wrong_number":   "What was wrong?",
-}
-
-// promptTag returns a tag string, "" for no tag, or "back" to re-prompt outcome.
-func promptTag(outcome string) string {
-	options := tagOptions[outcome]
-	if len(options) == 0 {
-		return ""
-	}
-	prompt := tagPrompts[outcome]
-
-	fmt.Println("\n  ─ TAG ──────────────────────────────────────────────")
-	fmt.Printf("  %s\n\n", prompt)
-	for i, opt := range options {
-		fmt.Printf("  %d  %s\n", i+1, opt)
-	}
-	fmt.Printf("\n  b  Back to outcome")
-	fmt.Printf("\n\n  Press 1–%d:\n", len(options))
+// promptSentiment returns a sentiment key, or "back" to re-prompt disposition.
+// Only called when disposition is "connected_dm".
+func promptSentiment() string {
+	fmt.Println("\n  ─ SENTIMENT ────────────────────────────────────────")
+	fmt.Print("  How did the conversation go?\n\n")
+	fmt.Println("  a  Call back later")
+	fmt.Println("  b  Pitch - Bad Fit")
+	fmt.Println("  c  Pitch - Not Interested")
+	fmt.Println("  d  Pitch - 1-2 Months")
+	fmt.Println("  e  Pitch - 3-5 Months")
+	fmt.Println("  f  Pitch - 6-12 Months")
+	fmt.Println("  g  Demo Scheduled")
+	fmt.Println("  h  Hang up")
+	fmt.Println("  i  Wrong DM Name")
+	fmt.Println("  j  DQ this lead")
+	fmt.Println("  k  Not the DM")
+	fmt.Println("\n  z  Back to disposition")
+	fmt.Println("\n  Press a–k:")
 	fmt.Print("> ")
 
+	sentiments := map[byte]string{
+		'a': "call_back_later",
+		'b': "pitch_bad_fit",
+		'c': "pitch_not_interested",
+		'd': "pitch_1_2_months",
+		'e': "pitch_3_5_months",
+		'f': "pitch_6_12_months",
+		'g': "demo_scheduled",
+		'h': "hang_up",
+		'i': "wrong_dm_name",
+		'j': "dq_lead",
+		'k': "not_dm",
+	}
 	for {
 		key, err := ReadKey()
 		if err != nil {
 			return ""
 		}
-		if key == 'b' || key == 'B' {
+		if key == 'z' || key == 'Z' {
 			fmt.Println()
 			return "back"
 		}
-		idx := int(key - '1')
-		if idx >= 0 && idx < len(options) {
-			selected := options[idx]
+		if s, ok := sentiments[key]; ok {
 			fmt.Println(string(key))
-			if selected == "No tag" {
-				return ""
-			}
-			return selected
+			return s
 		}
 	}
 }

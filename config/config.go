@@ -8,12 +8,13 @@ import (
 )
 
 type Config struct {
-	AnthropicAPIKey  string
-	BrowserlessToken string
-	AircallAPIID     string
-	AircallAPIToken  string
-	AircallNumberID  string
-	AircallUserID    string
+	AnthropicAPIKey     string
+	BrowserlessToken    string
+	AircallAPIID        string
+	AircallAPIToken     string
+	AircallNumberID     string
+	AircallUserID       string
+	HubSpotAccessToken  string
 }
 
 func Load() (*Config, error) {
@@ -21,12 +22,13 @@ func Load() (*Config, error) {
 	_ = godotenv.Load()
 
 	cfg := &Config{
-		AnthropicAPIKey:  os.Getenv("ANTHROPIC_API_KEY"),
-		BrowserlessToken: os.Getenv("BROWSERLESS_TOKEN"),
-		AircallAPIID:     os.Getenv("AIRCALL_API_ID"),
-		AircallAPIToken:  os.Getenv("AIRCALL_API_TOKEN"),
-		AircallNumberID:  os.Getenv("AIRCALL_NUMBER_ID"),
-		AircallUserID:    os.Getenv("AIRCALL_USER_ID"),
+		AnthropicAPIKey:    os.Getenv("ANTHROPIC_API_KEY"),
+		BrowserlessToken:   os.Getenv("BROWSERLESS_TOKEN"),
+		AircallAPIID:       os.Getenv("AIRCALL_API_ID"),
+		AircallAPIToken:    os.Getenv("AIRCALL_API_TOKEN"),
+		AircallNumberID:    os.Getenv("AIRCALL_NUMBER_ID"),
+		AircallUserID:      os.Getenv("AIRCALL_USER_ID"),
+		HubSpotAccessToken: os.Getenv("HUBSPOT_ACCESS_TOKEN"),
 	}
 
 	var missing []string
@@ -45,6 +47,21 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// LoadPartial loads all config values without requiring Anthropic/Browserless keys.
+// Use this for modes (dry-run, no-research) where API keys are optional.
+func LoadPartial() *Config {
+	_ = godotenv.Load()
+	return &Config{
+		AnthropicAPIKey:    os.Getenv("ANTHROPIC_API_KEY"),
+		BrowserlessToken:   os.Getenv("BROWSERLESS_TOKEN"),
+		AircallAPIID:       os.Getenv("AIRCALL_API_ID"),
+		AircallAPIToken:    os.Getenv("AIRCALL_API_TOKEN"),
+		AircallNumberID:    os.Getenv("AIRCALL_NUMBER_ID"),
+		AircallUserID:      os.Getenv("AIRCALL_USER_ID"),
+		HubSpotAccessToken: os.Getenv("HUBSPOT_ACCESS_TOKEN"),
+	}
 }
 
 func (c *Config) IsAircallConfigured() bool {

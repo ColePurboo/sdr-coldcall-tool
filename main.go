@@ -10,11 +10,15 @@ import (
 
 	"sdr-dialer/config"
 	"sdr-dialer/dialer"
+	"sdr-dialer/hubspot"
 	"sdr-dialer/leads"
 	"sdr-dialer/logger"
 	"sdr-dialer/research"
 	"sdr-dialer/session"
 )
+
+// postCallFn is called after each logged call to write back to an external system.
+type postCallFn func(eng hubspot.Engagement) error
 
 func main() {
 	fileFlag := flag.String("file", "", "Path to specific CSV (skips selection menu)")
@@ -25,18 +29,10 @@ func main() {
 	freshFlag := flag.Bool("fresh", false, "Ignore saved session and start from beginning")
 	flag.Parse()
 
-	// Config is only strictly required when making API calls
 	var cfg *config.Config
-	if *dryRun {
-		cfg = &config.Config{}
-	} else if *noResearch {
-		// Best-effort load; Aircall keys useful but not required
-		loaded, _ := config.Load()
-		if loaded != nil {
-			cfg = loaded
-		} else {
-			cfg = &config.Config{}
-		}
+	if *dryRun || *noResearch {
+		// Load all optional keys (HubSpot, Aircall) without requiring Anthropic/Browserless.
+		cfg = config.LoadPartial()
 	} else {
 		var err error
 		cfg, err = config.Load()
@@ -45,31 +41,84 @@ func main() {
 		}
 	}
 
-	csvPath := *fileFlag
-	if csvPath == "" {
+	// Determine source and load companies.
+	var (
+		companies      []*leads.Company
+		csvPath        string
+		csvDisplayName string
+		postCall       postCallFn
+	)
+
+	if *fileFlag != "" {
+		// Explicit CSV path bypasses source selection.
+		csvPath = *fileFlag
 		var err error
-		csvPath, err = selectCSV()
+		companies, err = leads.Load(csvPath)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintf(os.Stderr, "✗ Error loading CSV: %v\n", err)
 			os.Exit(1)
 		}
-		if csvPath == "" {
+		csvDisplayName = displayName(csvPath)
+	} else {
+		source := selectSource()
+		switch source {
+		case "quit":
 			return
+
+		case "hubspot":
+			if cfg.HubSpotAccessToken == "" {
+				fmt.Fprintln(os.Stderr, "✗ HUBSPOT_ACCESS_TOKEN not set. Add it to your .env file.")
+				fmt.Fprintln(os.Stderr, "  See .env.example for the template.")
+				os.Exit(1)
+			}
+			listID, listName, selectErr := selectHubSpotList(cfg.HubSpotAccessToken)
+			if selectErr != nil {
+				fmt.Fprintln(os.Stderr, "✗", selectErr)
+				os.Exit(1)
+			}
+			if listID == 0 {
+				return // user quit
+			}
+			fmt.Print("\n  Loading contacts from HubSpot...")
+			var loadErr error
+			companies, loadErr = hubspot.LoadContacts(cfg.HubSpotAccessToken, listID)
+			if loadErr != nil {
+				fmt.Fprintf(os.Stderr, "\n✗ Could not load HubSpot contacts: %v\n", loadErr)
+				os.Exit(1)
+			}
+			fmt.Printf(" done (%d companies)\n", len(companies))
+			csvPath = fmt.Sprintf("hubspot_list_%d", listID)
+			csvDisplayName = listName
+			token := cfg.HubSpotAccessToken
+			postCall = func(eng hubspot.Engagement) error {
+				return hubspot.WriteCallEngagement(token, eng)
+			}
+
+		case "csv":
+			selPath, selErr := selectCSV()
+			if selErr != nil {
+				fmt.Fprintln(os.Stderr, selErr)
+				os.Exit(1)
+			}
+			if selPath == "" {
+				return
+			}
+			csvPath = selPath
+			var loadErr error
+			companies, loadErr = leads.Load(csvPath)
+			if loadErr != nil {
+				fmt.Fprintf(os.Stderr, "✗ Error loading CSV: %v\n", loadErr)
+				os.Exit(1)
+			}
+			csvDisplayName = displayName(csvPath)
 		}
 	}
 
-	companies, err := leads.Load(csvPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "✗ Error loading CSV: %v\n", err)
-		os.Exit(1)
-	}
 	total := len(companies)
 	if total == 0 {
-		fmt.Println("No companies found in CSV.")
+		fmt.Println("No companies found.")
 		return
 	}
-
-	csvDisplayName := displayName(csvPath)
 
 	if *dryRun {
 		fmt.Printf("SDR Dialer — Dry Run\n%s\n%d companies found:\n\n", strings.Repeat("─", 50), total)
@@ -95,6 +144,7 @@ func main() {
 	startPos := 0
 	var sess *session.SessionState
 	var log *logger.Logger
+	var err error
 
 	if *fromFlag > 0 {
 		startPos = *fromFlag - 1
@@ -112,13 +162,15 @@ func main() {
 				_ = existing.Resume(log.Path())
 				sess = existing
 				sess.CSVPath = csvPath
-				runLoop(companies, startPos, total, csvPath, csvDisplayName, cfg, *noResearch, log, sess)
+				runLoop(companies, startPos, total, csvPath, csvDisplayName, cfg, *noResearch, log, sess, postCall)
 				return
 			case "s":
 				_ = existing.Delete()
-				if stripped, err2 := session.RenameCSV(csvPath, ""); err2 == nil {
-					csvPath = stripped
-					csvDisplayName = displayName(csvPath)
+				if !isHubSpotSource(csvPath) {
+					if stripped, err2 := session.RenameCSV(csvPath, ""); err2 == nil {
+						csvPath = stripped
+						csvDisplayName = displayName(csvPath)
+					}
 				}
 			case "q":
 				return
@@ -144,7 +196,7 @@ func main() {
 		}
 	}
 
-	runLoop(companies, startPos, total, csvPath, csvDisplayName, cfg, *noResearch, log, sess)
+	runLoop(companies, startPos, total, csvPath, csvDisplayName, cfg, *noResearch, log, sess, postCall)
 }
 
 func runLoop(
@@ -155,8 +207,9 @@ func runLoop(
 	noResearch bool,
 	log *logger.Logger,
 	sess *session.SessionState,
+	postCall postCallFn,
 ) {
-	prefixApplied := strings.HasPrefix(filepath.Base(csvPath), "[in progress]")
+	prefixApplied := isHubSpotSource(csvPath) || strings.HasPrefix(filepath.Base(csvPath), "[in progress]")
 	sessionCalls := 0
 	sessionStart := startPos + 1
 	sessionOutcomes := make(map[string]int)
@@ -168,7 +221,7 @@ func runLoop(
 
 	// briefCache lets us re-show already-fetched research when going back.
 	briefCache := make(map[int]research.Brief)
-	// calledAt tracks which positions had a call logged and with what outcome,
+	// calledAt tracks which positions had a call logged (and with what disposition)
 	// so we can undo the log entry when the user goes back.
 	calledAt := make(map[int]string)
 
@@ -199,13 +252,13 @@ func runLoop(
 		if result.Back {
 			// Going back: remove the previous company's log entry if it was a real call.
 			prev := i - 1
-			if outcome, called := calledAt[prev]; called {
+			if disposition, called := calledAt[prev]; called {
 				if err := log.RemoveLast(); err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: could not remove log entry: %v\n", err)
 				}
-				_ = sess.Retreat(outcome)
+				_ = sess.Retreat(disposition)
 				sessionCalls--
-				sessionOutcomes[outcome]--
+				sessionOutcomes[disposition]--
 				delete(calledAt, prev)
 			} else {
 				// Previous company was skipped — still need to retreat the position counter.
@@ -215,14 +268,14 @@ func runLoop(
 			continue
 		}
 
-		outcome := ""
+		disposition := ""
 		if !result.Skipped {
-			outcome = result.Outcome
+			disposition = result.Disposition
 		}
 
-		_ = sess.Advance(co.Name, outcome)
+		_ = sess.Advance(co.Name, disposition)
 
-		// Apply [in progress] prefix on first advance
+		// Apply [in progress] prefix on first advance (CSV mode only).
 		if !prefixApplied {
 			if newPath, err2 := session.RenameCSV(csvPath, "[in progress] "); err2 == nil {
 				csvPath = newPath
@@ -236,13 +289,13 @@ func runLoop(
 			continue
 		}
 
-		// Build and write log entry
+		// Build and write local log entry.
 		entry := logger.BuildEntry(
 			co,
 			co.Primary,
 			leads.BestPhone(co.Primary),
-			result.Outcome,
-			result.QuickTag,
+			result.Disposition,
+			result.Sentiment,
 			result.FreeText,
 			result.Brief,
 			result.Start,
@@ -252,27 +305,47 @@ func runLoop(
 			fmt.Fprintf(os.Stderr, "Warning: could not write log: %v\n", err)
 		}
 
-		calledAt[i] = result.Outcome
+		// Write back to HubSpot if in HubSpot mode.
+		if postCall != nil && co.Primary.HubSpotID != "" {
+			eng := hubspot.Engagement{
+				ContactID:   co.Primary.HubSpotID,
+				Title:       entry.HsCallTitle,
+				Disposition: logger.DispositionGUID(result.Disposition),
+				Duration:    entry.HsCallDuration,
+				Timestamp:   entry.HsTimestamp,
+				Body:        entry.HsCallBody,
+			}
+			if err := postCall(eng); err != nil {
+				fmt.Fprintf(os.Stderr, "  ⚠  HubSpot write-back failed: %v\n", err)
+			}
+		}
+
+		calledAt[i] = result.Disposition
 		sessionCalls++
-		sessionOutcomes[result.Outcome]++
+		sessionOutcomes[result.Disposition]++
 		i++
 	}
 
 	// Completed
 	_ = sess.Complete()
-	if _, err2 := session.RenameCSV(csvPath, "[completed] "); err2 != nil {
-		// Try stripping [in progress] first
-		stripped, _ := session.RenameCSV(csvPath, "")
-		session.RenameCSV(stripped, "[completed] ")
+	if !isHubSpotSource(csvPath) {
+		if _, err2 := session.RenameCSV(csvPath, "[completed] "); err2 != nil {
+			stripped, _ := session.RenameCSV(csvPath, "")
+			session.RenameCSV(stripped, "[completed] ")
+		}
 	}
 	printCompleteSummary(csvDisplayName, sess, sessionCalls, sessionStart, len(companies), sessionOutcomes, log.Path())
 }
 
+// isHubSpotSource returns true for virtual HubSpot session paths.
+func isHubSpotSource(path string) bool {
+	return strings.HasPrefix(path, "hubspot_list_")
+}
+
 // showResearchLoadingScreen warms the prefetch window and blocks until the
 // first company's research is ready, showing a live progress spinner.
-// It replaces the consumed channel so the main loop can read it normally.
 func showResearchLoadingScreen(pf *research.Prefetcher, startPos int, companies []*leads.Company) {
-	ch := pf.Chan(startPos) // kicks off up to 7 goroutines
+	ch := pf.Chan(startPos)
 	warmCount := pf.WarmCount(startPos)
 	name := companies[startPos].Name
 
@@ -288,7 +361,6 @@ func showResearchLoadingScreen(pf *research.Prefetcher, startPos int, companies 
 		case brief := <-ch:
 			fmt.Printf("\r  ✓  Research ready — starting dial session%s\n\n",
 				strings.Repeat(" ", 20))
-			// Restore the result so the main loop's RunCard call can read it.
 			refilled := make(chan research.Brief, 1)
 			refilled <- brief
 			pf.Set(startPos, refilled)
@@ -308,6 +380,78 @@ func displayName(csvPath string) string {
 		base = strings.TrimPrefix(base, p)
 	}
 	return base
+}
+
+// selectSource asks the user whether to load from HubSpot or a local CSV.
+func selectSource() string {
+	fmt.Print("\nSDR Dialer — Select source:\n\n")
+	fmt.Println("  1  HubSpot contact list")
+	fmt.Println("  2  Local CSV file")
+	fmt.Println("\n  q  Quit")
+	fmt.Println("\n  Press a key:")
+	fmt.Print("> ")
+
+	for {
+		key, err := dialer.ReadKey()
+		if err != nil {
+			return "quit"
+		}
+		switch key {
+		case '1':
+			fmt.Println()
+			return "hubspot"
+		case '2':
+			fmt.Println()
+			return "csv"
+		case 'q', 'Q', 3:
+			fmt.Println()
+			return "quit"
+		}
+	}
+}
+
+// selectHubSpotList fetches available lists and lets the user pick one.
+// Returns (0, "", nil) if the user quits.
+func selectHubSpotList(token string) (int, string, error) {
+	fmt.Println("\n  Fetching HubSpot contact lists...")
+	lists, err := hubspot.FetchLists(token)
+	if err != nil {
+		return 0, "", fmt.Errorf("could not fetch HubSpot lists: %w", err)
+	}
+	if len(lists) == 0 {
+		return 0, "", fmt.Errorf("no contact lists found in HubSpot")
+	}
+
+	// Display up to 9 lists (single-keypress selection).
+	max := min(len(lists), 9)
+
+	fmt.Printf("\n  Select a HubSpot list:\n\n")
+	for i, l := range lists[:max] {
+		fmt.Printf("  %d. %-45s (%d contacts)\n", i+1, l.Name, l.Size)
+	}
+	if len(lists) > 9 {
+		fmt.Printf("\n  (showing first 9 of %d lists)\n", len(lists))
+	}
+	fmt.Println("\n  q  Back")
+	fmt.Println("\n  Press a number key:")
+	fmt.Print("> ")
+
+	for {
+		key, err := dialer.ReadKey()
+		if err != nil {
+			return 0, "", nil
+		}
+		if key == 'q' || key == 'Q' || key == 3 {
+			fmt.Println()
+			return 0, "", nil
+		}
+		idx := int(key - '1')
+		if idx >= 0 && idx < max {
+			fmt.Println()
+			l := lists[idx]
+			return l.ListID, l.Name, nil
+		}
+	}
 }
 
 func selectCSV() (string, error) {
@@ -332,7 +476,7 @@ func selectCSV() (string, error) {
 			}
 		}
 
-		fmt.Print("\nSDR Dialer — Select a lead list:\n\n")
+		fmt.Print("\n  Select a lead list:\n\n")
 		num := 1
 		var displayFiles []leads.CSVFile
 
@@ -375,7 +519,7 @@ func selectCSV() (string, error) {
 		if !showCompleted && len(completed) > 0 {
 			fmt.Println("  c  Show completed lists")
 		}
-		fmt.Println("  q  Quit")
+		fmt.Println("  q  Back")
 		fmt.Println("\n  Press a number key to select a list:")
 		fmt.Print("> ")
 
@@ -409,10 +553,13 @@ func countCompanies(path string) int {
 
 func promptResume(sess *session.SessionState) string {
 	name := displayName(sess.CSVPath)
+	if isHubSpotSource(sess.CSVPath) {
+		name = sess.CSVPath // use the raw virtual path as a fallback label
+	}
 	lastActive, _ := time.Parse(time.RFC3339, sess.LastActiveAt)
 	dateStr := lastActive.Format("2006-01-02")
 
-	fmt.Printf("\n  ↩  %s.csv has a saved session.\n", name)
+	fmt.Printf("\n  ↩  %s has a saved session.\n", name)
 	fmt.Printf("     Last position: company %d of %d", sess.CurrentPosition, sess.TotalCompanies)
 	if sess.LastCompanyName != "" {
 		fmt.Printf(" (%s)", sess.LastCompanyName)
@@ -465,7 +612,7 @@ func printResearchBrief(brief research.Brief) {
 	}
 }
 
-func printQuitSummary(name string, sess *session.SessionState, sessionCalls, sessionStart, currentPos int, outcomes map[string]int, logPath string) {
+func printQuitSummary(name string, sess *session.SessionState, sessionCalls, sessionStart, currentPos int, dispositions map[string]int, logPath string) {
 	fmt.Printf("\n%s\n", strings.Repeat("━", 51))
 	fmt.Printf("  SESSION PAUSED — %s\n", name)
 	fmt.Printf("%s\n\n", strings.Repeat("━", 51))
@@ -474,47 +621,62 @@ func printQuitSummary(name string, sess *session.SessionState, sessionCalls, ses
 		pct := int(float64(sess.CurrentPosition) / float64(sess.TotalCompanies) * 100)
 		fmt.Printf("  Progress:       %d / %d companies  (%d%%)\n\n", sess.CurrentPosition, sess.TotalCompanies, pct)
 	}
-	if len(outcomes) > 0 {
-		fmt.Println("  Outcomes (this session):")
-		printOutcomeTable(outcomes)
+	if len(dispositions) > 0 {
+		fmt.Println("  Dispositions (this session):")
+		printDispositionTable(dispositions)
 	}
-	fmt.Printf("\n  Session saved. Resume any time by selecting:\n  [in progress] %s.csv\n\n", name)
+	fmt.Printf("\n  Session saved. Resume any time.\n\n")
 	fmt.Printf("  Log file:\n  %s\n", logPath)
 	fmt.Printf("%s\n", strings.Repeat("━", 51))
 }
 
-func printCompleteSummary(name string, sess *session.SessionState, sessionCalls, sessionStart, total int, outcomes map[string]int, logPath string) {
+func printCompleteSummary(name string, sess *session.SessionState, sessionCalls, sessionStart, total int, dispositions map[string]int, logPath string) {
 	fmt.Printf("\n%s\n", strings.Repeat("━", 51))
 	fmt.Printf("  ✓ LIST COMPLETE — %s\n", name)
 	fmt.Printf("%s\n\n", strings.Repeat("━", 51))
 	fmt.Printf("  This session:   %d calls  (companies %d–%d)\n", sessionCalls, sessionStart, total)
 	if sess != nil {
 		fmt.Printf("  All sessions:   %d companies total across %d session(s)\n\n", sess.TotalCompanies, sess.SessionCount)
-		if len(sess.OutcomeCounts) > 0 {
-			fmt.Println("  Outcomes (all-time):")
-			printOutcomeTable(sess.OutcomeCounts)
-		}
+	}
+	if len(dispositions) > 0 {
+		fmt.Println("  Dispositions (this session):")
+		printDispositionTable(dispositions)
+	}
+	if sess != nil && sess.SessionCount > 1 && len(sess.OutcomeCounts) > 0 {
+		fmt.Println("\n  Dispositions (all sessions):")
+		printDispositionTable(sess.OutcomeCounts)
 	}
 	fmt.Printf("\n  Log file:\n  %s\n", logPath)
-	fmt.Printf("\n  CSV marked as [completed].\n")
 	fmt.Printf("%s\n", strings.Repeat("━", 51))
 }
 
-func printOutcomeTable(outcomes map[string]int) {
-	order := []string{"interested", "voicemail", "no_answer", "not_interested", "wrong_number"}
+func printDispositionTable(dispositions map[string]int) {
+	order := []string{
+		"no_answer",
+		"number_not_in_service",
+		"contact_retired",
+		"instant_hangup_dm",
+		"connected_dm",
+		"connected_reception",
+		"need_to_enrich",
+		"other",
+	}
 	labels := map[string]string{
-		"interested":     "Interested",
-		"voicemail":      "Voicemail",
-		"no_answer":      "No answer",
-		"not_interested": "Not interested",
-		"wrong_number":   "Wrong / bad",
+		"no_answer":             "No Answer",
+		"number_not_in_service": "Not in service",
+		"contact_retired":       "Contact retired",
+		"instant_hangup_dm":     "Hangup w/DM",
+		"connected_dm":          "Connected w/DM",
+		"connected_reception":   "Connected w/Reception",
+		"need_to_enrich":        "Need to enrich",
+		"other":                 "Other",
 	}
 	total := 0
-	for _, v := range outcomes {
+	for _, v := range dispositions {
 		total += v
 	}
 	for _, key := range order {
-		count := outcomes[key]
+		count := dispositions[key]
 		if count == 0 {
 			continue
 		}
@@ -523,6 +685,6 @@ func printOutcomeTable(outcomes map[string]int) {
 			pct = count * 100 / total
 		}
 		bar := strings.Repeat("█", pct/10) + strings.Repeat("░", 10-pct/10)
-		fmt.Printf("  %-20s %3d  %s  %d%%\n", labels[key]+":", count, bar, pct)
+		fmt.Printf("  %-22s %3d  %s  %d%%\n", labels[key]+":", count, bar, pct)
 	}
 }

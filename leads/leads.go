@@ -17,6 +17,7 @@ type Contact struct {
 	Email        string
 	CompanyPhone string
 	MobilePhone  string
+	HubSpotID    string // populated when loaded from HubSpot; empty for CSV contacts
 }
 
 type Company struct {
