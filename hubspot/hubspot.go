@@ -32,34 +32,44 @@ type Engagement struct {
 	Body        string // formatted notes
 }
 
-// FetchLists retrieves all contact lists from HubSpot (up to 250).
+// FetchLists retrieves all contact lists from HubSpot, paginating as needed.
 func FetchLists(token string) ([]HSList, error) {
-	url := baseURL + "/contacts/v1/lists?count=250"
-	body, err := get(token, url)
-	if err != nil {
-		return nil, err
-	}
+	var out []HSList
+	offset := 0
+	for {
+		url := fmt.Sprintf("%s/contacts/v1/lists?count=250&offset=%d", baseURL, offset)
+		body, err := get(token, url)
+		if err != nil {
+			return nil, err
+		}
 
-	var resp struct {
-		Lists []struct {
-			ListID   int    `json:"listId"`
-			Name     string `json:"name"`
-			MetaData struct {
-				Size int `json:"size"`
-			} `json:"metaData"`
-		} `json:"lists"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("parse lists response: %w", err)
-	}
+		var resp struct {
+			Lists []struct {
+				ListID   int    `json:"listId"`
+				Name     string `json:"name"`
+				MetaData struct {
+					Size int `json:"size"`
+				} `json:"metaData"`
+			} `json:"lists"`
+			HasMore bool `json:"has-more"`
+			Offset  int  `json:"offset"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, fmt.Errorf("parse lists response: %w", err)
+		}
 
-	out := make([]HSList, 0, len(resp.Lists))
-	for _, l := range resp.Lists {
-		out = append(out, HSList{
-			ListID: l.ListID,
-			Name:   l.Name,
-			Size:   l.MetaData.Size,
-		})
+		for _, l := range resp.Lists {
+			out = append(out, HSList{
+				ListID: l.ListID,
+				Name:   l.Name,
+				Size:   l.MetaData.Size,
+			})
+		}
+
+		if !resp.HasMore {
+			break
+		}
+		offset = resp.Offset
 	}
 	return out, nil
 }

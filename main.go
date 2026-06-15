@@ -411,7 +411,7 @@ func selectSource() string {
 }
 
 // selectHubSpotList fetches available lists and lets the user pick one.
-// Returns (0, "", nil) if the user quits.
+// Shows 9 per page with n/p navigation. Returns (0, "", nil) if the user quits.
 func selectHubSpotList(token string) (int, string, error) {
 	fmt.Println("\n  Fetching HubSpot contact lists...")
 	lists, err := hubspot.FetchLists(token)
@@ -422,34 +422,60 @@ func selectHubSpotList(token string) (int, string, error) {
 		return 0, "", fmt.Errorf("no contact lists found in HubSpot")
 	}
 
-	// Display up to 9 lists (single-keypress selection).
-	max := min(len(lists), 9)
+	const pageSize = 9
+	page := 0
+	totalPages := (len(lists) + pageSize - 1) / pageSize
 
-	fmt.Printf("\n  Select a HubSpot list:\n\n")
-	for i, l := range lists[:max] {
-		fmt.Printf("  %d. %-45s (%d contacts)\n", i+1, l.Name, l.Size)
+	printPage := func() {
+		start := page * pageSize
+		end := min(start+pageSize, len(lists))
+		slice := lists[start:end]
+
+		fmt.Printf("\n  Select a HubSpot list:  (page %d of %d)\n\n", page+1, totalPages)
+		for i, l := range slice {
+			fmt.Printf("  %d. %-45s (%d contacts)\n", i+1, l.Name, l.Size)
+		}
+		fmt.Println()
+		if totalPages > 1 {
+			if page < totalPages-1 {
+				fmt.Println("  n  Next page")
+			}
+			if page > 0 {
+				fmt.Println("  p  Previous page")
+			}
+		}
+		fmt.Println("  q  Back")
+		fmt.Printf("\n  Press a number key (1–%d):\n> ", len(slice))
 	}
-	if len(lists) > 9 {
-		fmt.Printf("\n  (showing first 9 of %d lists)\n", len(lists))
-	}
-	fmt.Println("\n  q  Back")
-	fmt.Println("\n  Press a number key:")
-	fmt.Print("> ")
+
+	printPage()
 
 	for {
 		key, err := dialer.ReadKey()
 		if err != nil {
 			return 0, "", nil
 		}
-		if key == 'q' || key == 'Q' || key == 3 {
+		switch {
+		case key == 'q' || key == 'Q' || key == 3:
 			fmt.Println()
 			return 0, "", nil
-		}
-		idx := int(key - '1')
-		if idx >= 0 && idx < max {
+		case (key == 'n' || key == 'N') && page < totalPages-1:
+			page++
 			fmt.Println()
-			l := lists[idx]
-			return l.ListID, l.Name, nil
+			printPage()
+		case (key == 'p' || key == 'P') && page > 0:
+			page--
+			fmt.Println()
+			printPage()
+		default:
+			start := page * pageSize
+			end := min(start+pageSize, len(lists))
+			idx := int(key-'1') + start
+			if idx >= start && idx < end {
+				fmt.Println()
+				l := lists[idx]
+				return l.ListID, l.Name, nil
+			}
 		}
 	}
 }
