@@ -26,13 +26,14 @@ go build -o sdr .
 Go CLI app. `main.go` is the orchestrator; all other logic lives in packages.
 
 ```
-main.go           CSV selection, session management, main company loop
-config/           Load/validate .env (Anthropic, Browserless, Aircall keys)
+main.go           CSV/HubSpot selection, session management, main company loop
+config/           Load/validate .env (Anthropic, Browserless, Aircall, HubSpot keys)
 leads/            CSV parsing, company grouping, contact title-tier prioritization
 research/         AI research pipeline: scrape → web search → Claude reasoning → Brief struct
 dialer/           Terminal UI (raw key reads), call flow, Aircall API integration
 logger/           Atomic JSON call log writes, HubSpot-compatible format
 session/          Session state persistence (.sessions/*.session.json), progress tracking
+hubspot/          HubSpot contact list fetching, company grouping, call engagement writes
 ```
 
 **Data flow through main loop:**
@@ -56,8 +57,13 @@ session/          Session state persistence (.sessions/*.session.json), progress
 | Anthropic Claude Haiku 4.5 | Web search + research reasoning | `ANTHROPIC_API_KEY` |
 | Browserless.io | Website scraping | `BROWSERLESS_TOKEN` |
 | Aircall | Optional softphone dialing | `AIRCALL_API_ID`, `AIRCALL_API_TOKEN`, `AIRCALL_NUMBER_ID`, `AIRCALL_USER_ID` |
+| HubSpot | Contact list source + call engagement writes | `HUBSPOT_ACCESS_TOKEN` |
 
-Aircall is optional — the dialer falls back to simulated call if not configured. Research pipeline is skipped entirely with `--no-research`.
+All keys except `ANTHROPIC_API_KEY` and `BROWSERLESS_TOKEN` are optional. Copy `.env.example` to `.env` to get started.
+
+- Aircall falls back to a simulated call if not configured; `--no-aircall` forces this even when Aircall is configured.
+- HubSpot: when `HUBSPOT_ACCESS_TOKEN` is set, the main menu offers HubSpot lists as a lead source and writes call engagements back after each call.
+- Research pipeline is skipped entirely with `--no-research`.
 
 ## Research pipeline detail
 
@@ -67,3 +73,14 @@ Aircall is optional — the dialer falls back to simulated call if not configure
 3. **Reason** — Claude synthesizes a `Brief` struct: `WhatTheyDo`, `WhoTheyServe`, `PaymentComplexity`, `VennFit`, `Hook`
 
 Rate-limit handling: reads Anthropic 429 `retry-after` headers and backs off with exponential waits.
+
+## Dialer call flow
+
+After `c`all, the SDR is prompted for:
+1. **Disposition** (1–8): `no_answer`, `number_not_in_service`, `contact_retired`, `instant_hangup_dm`, `connected_dm`, `connected_reception`, `need_to_enrich`, `other`
+2. **Sentiment** (a–k, only if `connected_dm`): ranges from `call_back_later` through `demo_scheduled`
+3. **Free-text notes** (optional, any string)
+
+The `n` key cycles through alternate contacts at the same company without logging a call. The `b` key undoes the last logged call (removes log entry + decrements session counters).
+
+Disposition keys map to hardcoded HubSpot GUIDs in `logger/logger.go` — update both the internal key list and the `dispositionGUID()` map if adding new outcomes.
