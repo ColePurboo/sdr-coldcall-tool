@@ -28,6 +28,7 @@ type Engagement struct {
 	Title          string
 	Disposition    string // HubSpot disposition GUID
 	DispositionKey string // internal key, used to set the contact's Disposition property
+	SentimentKey   string // internal key, used to set the contact's Sentiments property
 	Duration       int64  // milliseconds
 	Timestamp      string // RFC3339
 	Body           string // formatted notes
@@ -44,6 +45,22 @@ var contactDispositionLabel = map[string]string{
 	"connected_reception":   "Connected w/Reception",
 	"need_to_enrich":        "Need to enrich",
 	"other":                 "Other",
+}
+
+// contactSentimentLabel maps internal sentiment keys to the exact enum values
+// of the HubSpot contact "sentiments" property.
+var contactSentimentLabel = map[string]string{
+	"call_back_later":      "Call back later",
+	"pitch_bad_fit":        "Pitch - Bad Fit",
+	"pitch_not_interested": "Pitch - Not Interested",
+	"pitch_1_2_months":     "Pitch - 1-5 Months",
+	"pitch_3_5_months":     "Pitch - 3-5 Months",
+	"pitch_6_12_months":    "Pitch 6-12 Months",
+	"demo_scheduled":       "Demo Scheduled",
+	"hang_up":              "Hang Up",
+	"wrong_dm_name":        "Wrong DM Name",
+	"dq_lead":              "DQ this lead",
+	"not_dm":               "Not the DM",
 }
 
 // FetchLists retrieves all contact lists from HubSpot, paginating as needed.
@@ -244,14 +261,19 @@ func WriteCallEngagement(token string, eng Engagement) error {
 		return fmt.Errorf("associate call with contact: %w", err)
 	}
 
-	// 3. Update the contact's Disposition property if we have a key for it.
+	// 3. Update the contact's Disposition and Sentiments properties.
+	contactProps := map[string]string{}
 	if label, ok := contactDispositionLabel[eng.DispositionKey]; ok {
+		contactProps["disposition"] = label
+	}
+	if label, ok := contactSentimentLabel[eng.SentimentKey]; ok {
+		contactProps["sentiments"] = label
+	}
+	if len(contactProps) > 0 {
 		contactURL := fmt.Sprintf("%s/crm/v3/objects/contacts/%s", baseURL, eng.ContactID)
-		patchData, _ := json.Marshal(map[string]any{
-			"properties": map[string]string{"disposition": label},
-		})
+		patchData, _ := json.Marshal(map[string]any{"properties": contactProps})
 		if err := patch(token, contactURL, patchData); err != nil {
-			return fmt.Errorf("update contact disposition: %w", err)
+			return fmt.Errorf("update contact properties: %w", err)
 		}
 	}
 
