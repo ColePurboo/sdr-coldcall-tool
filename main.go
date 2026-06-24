@@ -311,12 +311,13 @@ func runLoop(
 		// Write back to HubSpot if in HubSpot mode.
 		if postCall != nil && dialedContact.HubSpotID != "" {
 			eng := hubspot.Engagement{
-				ContactID:   dialedContact.HubSpotID,
-				Title:       entry.HsCallTitle,
-				Disposition: logger.DispositionGUID(result.Disposition),
-				Duration:    entry.HsCallDuration,
-				Timestamp:   entry.HsTimestamp,
-				Body:        entry.HsCallBody,
+				ContactID:      dialedContact.HubSpotID,
+				Title:          entry.HsCallTitle,
+				Disposition:    logger.DispositionGUID(result.Disposition),
+				DispositionKey: result.Disposition,
+				Duration:       entry.HsCallDuration,
+				Timestamp:      entry.HsTimestamp,
+				Body:           entry.HsCallBody,
 			}
 			if err := postCall(eng); err != nil {
 				fmt.Fprintf(os.Stderr, "  ⚠  HubSpot write-back failed: %v\n", err)

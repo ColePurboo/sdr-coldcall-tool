@@ -24,12 +24,26 @@ type HSList struct {
 
 // Engagement holds call data to write back to HubSpot.
 type Engagement struct {
-	ContactID   string
-	Title       string
-	Disposition string // HubSpot disposition GUID
-	Duration    int64  // milliseconds
-	Timestamp   string // RFC3339
-	Body        string // formatted notes
+	ContactID      string
+	Title          string
+	Disposition    string // HubSpot disposition GUID
+	DispositionKey string // internal key, used to set the contact's Disposition property
+	Duration       int64  // milliseconds
+	Timestamp      string // RFC3339
+	Body           string // formatted notes
+}
+
+// contactDispositionLabel maps internal disposition keys to the exact enum values
+// of the HubSpot contact "disposition" property.
+var contactDispositionLabel = map[string]string{
+	"no_answer":             "No Answer",
+	"number_not_in_service": "Number not in Service",
+	"contact_retired":       "Contact Retired",
+	"instant_hangup_dm":     "Instant hangup w/DM",
+	"connected_dm":          "Connected w/DM",
+	"connected_reception":   "Connected w/Reception",
+	"need_to_enrich":        "Need to enrich",
+	"other":                 "Other",
 }
 
 // FetchLists retrieves all contact lists from HubSpot, paginating as needed.
@@ -230,6 +244,17 @@ func WriteCallEngagement(token string, eng Engagement) error {
 		return fmt.Errorf("associate call with contact: %w", err)
 	}
 
+	// 3. Update the contact's Disposition property if we have a key for it.
+	if label, ok := contactDispositionLabel[eng.DispositionKey]; ok {
+		contactURL := fmt.Sprintf("%s/crm/v3/objects/contacts/%s", baseURL, eng.ContactID)
+		patchData, _ := json.Marshal(map[string]any{
+			"properties": map[string]string{"disposition": label},
+		})
+		if err := patch(token, contactURL, patchData); err != nil {
+			return fmt.Errorf("update contact disposition: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -275,6 +300,28 @@ func post(token, url string, data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("HubSpot API %s: %s", resp.Status, body)
 	}
 	return body, nil
+}
+
+// patch performs an authenticated PATCH with a JSON body.
+func patch(token, url string, data []byte) error {
+	req, err := http.NewRequest(http.MethodPatch, url, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("HubSpot API %s: %s", resp.Status, body)
+	}
+	return nil
 }
 
 // put performs an authenticated PUT (no body, just association).
