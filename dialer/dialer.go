@@ -203,14 +203,14 @@ func RunCard(
 					}
 				}
 			}
-			result, cidx, aborted := doCall(phone, co, brief, cfg, noAircall)
+			result, _, aborted := doCall(phone, co, brief, cfg, noAircall)
 			if aborted {
 				fmt.Println("\n  ← Call cancelled.")
 				printPrompt()
 				continue
 			}
 			result.Brief = brief
-			return result, cidx
+			return result, contactIdx
 
 		case 's', 'S':
 			fmt.Println()

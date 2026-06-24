@@ -239,7 +239,7 @@ func runLoop(
 			ch = prefetcher.Chan(i)
 		}
 
-		result, _ := dialer.RunCard(co, 0, position, total, csvDisplayName, ch, i > startPos, cfg, noAircall)
+		result, contactIdx := dialer.RunCard(co, 0, position, total, csvDisplayName, ch, i > startPos, cfg, noAircall)
 
 		// Cache the brief so going back can re-display it instantly.
 		if result.Brief.WhatTheyDo != "" || result.Brief.Raw != "" {
@@ -292,10 +292,11 @@ func runLoop(
 		}
 
 		// Build and write local log entry.
+		dialedContact := co.Contacts[contactIdx]
 		entry := logger.BuildEntry(
 			co,
-			co.Primary,
-			leads.BestPhone(co.Primary),
+			dialedContact,
+			leads.BestPhone(dialedContact),
 			result.Disposition,
 			result.Sentiment,
 			result.FreeText,
@@ -308,9 +309,9 @@ func runLoop(
 		}
 
 		// Write back to HubSpot if in HubSpot mode.
-		if postCall != nil && co.Primary.HubSpotID != "" {
+		if postCall != nil && dialedContact.HubSpotID != "" {
 			eng := hubspot.Engagement{
-				ContactID:   co.Primary.HubSpotID,
+				ContactID:   dialedContact.HubSpotID,
 				Title:       entry.HsCallTitle,
 				Disposition: logger.DispositionGUID(result.Disposition),
 				Duration:    entry.HsCallDuration,
