@@ -316,6 +316,7 @@ func runLoop(
 				Disposition:    logger.DispositionGUID(result.Disposition),
 				DispositionKey: result.Disposition,
 				SentimentKey:   result.Sentiment,
+				Notes:          result.FreeText,
 				Duration:       entry.HsCallDuration,
 				Timestamp:      entry.HsTimestamp,
 				Body:           entry.HsCallBody,

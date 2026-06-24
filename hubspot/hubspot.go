@@ -29,6 +29,7 @@ type Engagement struct {
 	Disposition    string // HubSpot disposition GUID
 	DispositionKey string // internal key, used to set the contact's Disposition property
 	SentimentKey   string // internal key, used to set the contact's Sentiments property
+	Notes          string // free-text notes written to the contact's Quick Notes field
 	Duration       int64  // milliseconds
 	Timestamp      string // RFC3339
 	Body           string // formatted notes
@@ -268,6 +269,9 @@ func WriteCallEngagement(token string, eng Engagement) error {
 	}
 	if label, ok := contactSentimentLabel[eng.SentimentKey]; ok {
 		contactProps["sentiments"] = label
+	}
+	if eng.Notes != "" {
+		contactProps["quick_notes"] = eng.Notes
 	}
 	if len(contactProps) > 0 {
 		contactURL := fmt.Sprintf("%s/crm/v3/objects/contacts/%s", baseURL, eng.ContactID)
