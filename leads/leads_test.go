@@ -36,17 +36,19 @@ func TestFinanceFirstRank(t *testing.T) {
 		{"VP Finance", 0},
 		{"Director of Financial Planning", 0},
 		{"Controller", 0},
-		{"Staff Accountant", 0},
-		{"Accounts Payable Clerk", 0},
-		{"Bookkeeper", 0},
-		{"CPA", 0},
-		{"Payroll Manager", 0},
-		{"CEO", 1},
-		{"President & Owner", 1},
-		{"Founder", 1},
-		{"Head of Marketing", 2},
-		{"Account Executive", 2}, // sales, not finance
-		{"", 2},
+		{"Senior Vice President, Finance & Operations", 0},
+		{"Staff Accountant", 1},
+		{"Accounts Payable Clerk", 1},
+		{"Bookkeeper", 1},
+		{"CPA", 1},
+		{"Payroll Manager", 1},
+		{"Financial Analyst", 1}, // finance, but not senior -> below the CFO
+		{"CEO", 2},
+		{"President & Owner", 2},
+		{"Founder", 2},
+		{"Head of Marketing", 3},
+		{"Account Executive", 3}, // sales, not finance
+		{"", 3},
 	}
 	for _, c := range cases {
 		if got := financeFirstRank(c.title); got != c.want {

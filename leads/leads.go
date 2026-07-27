@@ -40,29 +40,39 @@ type Company struct {
 	Primary   Contact
 }
 
+func containsAny(s string, subs []string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // financeFirstRank ranks a title for scroll order within a company:
-// 0 = finance (dial these first), 1 = executive, 2 = everyone else.
-// This is the order the SDR wants to work contacts in — finance DMs, then
-// the CEO/owner, then the rest.
+// 0 = senior finance / the finance decision-maker (CFO, Controller, VP Finance…),
+// 1 = other finance & accounting roles, 2 = top executives, 3 = everyone else.
+// This is the order the SDR wants to work contacts in — the finance DM first,
+// then the rest of finance, then the CEO/owner, then everyone else.
 func financeFirstRank(title string) int {
 	t := strings.ToLower(title)
-	finance := []string{
-		"cfo", "chief financial", "controller", "comptroller", "financ",
-		"accountant", "accounting", "accounts", "bookkeeper", "treasur",
-		"cpa", "payroll",
+	hasFinance := strings.Contains(t, "financ")
+	senior := containsAny(t, []string{"chief", "vp", "vice president", "svp", "evp", "head of", "director"})
+
+	// Tier 0: the finance decision-maker.
+	if containsAny(t, []string{"cfo", "chief financial", "controller", "comptroller", "treasur"}) ||
+		(hasFinance && senior) {
+		return 0
 	}
-	for _, kw := range finance {
-		if strings.Contains(t, kw) {
-			return 0
-		}
+	// Tier 1: other finance / accounting roles.
+	if containsAny(t, []string{"financ", "accountant", "accounting", "accounts", "bookkeep", "payroll", "cpa"}) {
+		return 1
 	}
-	exec := []string{"ceo", "chief executive", "president", "owner", "founder", "co-founder", "co founder"}
-	for _, kw := range exec {
-		if strings.Contains(t, kw) {
-			return 1
-		}
+	// Tier 2: top executives.
+	if containsAny(t, []string{"ceo", "chief executive", "president", "owner", "founder", "co-founder", "co founder"}) {
+		return 2
 	}
-	return 2
+	return 3
 }
 
 // SortContacts orders a company's contacts finance-first, then executives, then
