@@ -76,11 +76,18 @@ Rate-limit handling: reads Anthropic 429 `retry-after` headers and backs off wit
 
 ## Dialer call flow
 
+The company card shows a **CONTACTS roster** (all contacts at the company, each with title and available number-type tags) plus the selected contact's dialable number. Contacts are ordered **finance-first, then executives, then the rest** (`leads.SortContacts`), so the top finance DM is selected by default.
+
+Navigation keys on the card:
+- `n` / `p` — scroll to the next / previous contact (resets the number selection)
+- `m` — cycle the selected contact's numbers (mobile → office → any custom HubSpot phone fields, each tagged)
+- `c` calls the **currently selected number**; `s` skip; `b` undoes the last logged call; `q` quit
+
 After `c`all, the SDR is prompted for:
 1. **Disposition** (1–8): `no_answer`, `number_not_in_service`, `contact_retired`, `instant_hangup_dm`, `connected_dm`, `connected_reception`, `need_to_enrich`, `other`
 2. **Sentiment** (a–k, only if `connected_dm`): ranges from `call_back_later` through `demo_scheduled`
 3. **Free-text notes** (optional, any string)
 
-The `n` key cycles through alternate contacts at the same company without logging a call. The `b` key undoes the last logged call (removes log entry + decrements session counters).
+The exact dialed number and its type are captured on `CallResult` (`DialedPhone`/`DialedPhoneLabel`) and logged (`main.go` passes them to `logger.BuildEntry`) so the CRM record reflects what was actually dialed, not the default. Phone numbers live on `leads.Contact.Phones` (`[]leads.Phone{Number,Label}`); HubSpot phone-number properties (including custom fields) are auto-discovered in `hubspot.LoadContacts`.
 
 Disposition keys map to hardcoded HubSpot GUIDs in `logger/logger.go` — update both the internal key list and the `dispositionGUID()` map if adding new outcomes.

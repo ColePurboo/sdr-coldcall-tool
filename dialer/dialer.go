@@ -81,20 +81,36 @@ func wordWrap(s string, width int, indent string) string {
 
 // CallResult holds everything captured during one company interaction.
 type CallResult struct {
-	Disposition string
-	Sentiment   string // only set when Disposition == "connected_dm"
-	FreeText    string
-	Brief       research.Brief
-	Start       time.Time
-	End         time.Time
-	Skipped     bool
-	Quit        bool
-	Back        bool // go to previous company
+	Disposition      string
+	Sentiment        string // only set when Disposition == "connected_dm"
+	FreeText         string
+	Brief            research.Brief
+	Start            time.Time
+	End              time.Time
+	DialedPhone      string // the number actually dialed (the SDR's selection)
+	DialedPhoneLabel string // its type tag ("mobile", "office", …)
+	Skipped          bool
+	Quit             bool
+	Back             bool // go to previous company
+}
+
+// phoneSummary lists a contact's available number types for the roster line.
+func phoneSummary(c leads.Contact) string {
+	phones := leads.PhonesFor(c)
+	if len(phones) == 0 {
+		return "no #"
+	}
+	labels := make([]string, len(phones))
+	for i, p := range phones {
+		labels[i] = p.Label
+	}
+	return strings.Join(labels, ", ")
 }
 
 // RunCard displays one company card and drives the call interaction.
 // researchCh must be a buffered channel (cap 1) with research already in flight.
 // hasPrevious indicates whether a previous company exists to go back to.
+// The returned int is the index of the contact that was on screen (dialed/skipped).
 func RunCard(
 	co *leads.Company,
 	contactIdx int,
@@ -105,74 +121,122 @@ func RunCard(
 	cfg *config.Config,
 	noAircall bool,
 ) (CallResult, int) {
-	// Separator between company cards (no full clear — SDR can scroll up)
-	fmt.Print("\n\n")
-	fmt.Println(barSep)
-	fmt.Printf("  %s  ·  %d / %d\n", csvDisplayName, position, total)
-	fmt.Printf("  %s\n", session.RenderProgressBar(position, total, 30))
-	fmt.Println(barSep)
-
-	contact := co.Contacts[contactIdx]
-	phone := leads.BestPhone(contact)
-	phoneLabel := leads.PhoneLabel(contact)
-	if phone == "" {
-		phone = "—"
-		phoneLabel = "none"
+	if contactIdx < 0 || contactIdx >= len(co.Contacts) {
+		contactIdx = 0
 	}
-
-	fmt.Printf("\n  CONTACT   %s %s — %s\n", contact.FirstName, contact.LastName, contact.Title)
-	fmt.Printf("  PHONE     %s  (%s)\n", phone, phoneLabel)
-	if contact.Email != "" {
-		fmt.Printf("  EMAIL     %s\n", contact.Email)
-	}
-	fmt.Printf("  COMPANY   %s\n", co.Name)
-
-	var parts []string
-	if co.City != "" {
-		parts = append(parts, co.City)
-	}
-	if co.Province != "" {
-		parts = append(parts, co.Province)
-	}
-	if co.Employees != "" {
-		parts = append(parts, co.Employees+" employees")
-	}
-	if co.Industry != "" {
-		parts = append(parts, co.Industry)
-	}
-	if len(parts) > 0 {
-		fmt.Printf("            %s\n", strings.Join(parts, " · "))
-	}
-	if co.Website != "" {
-		fmt.Printf("  WEBSITE   %s\n", websiteLink(co.Website))
-	}
-
-	// Research section — try to show immediately if prefetch already landed
-	fmt.Println("\n  ─ RESEARCH ────────────────────────────────────────")
+	phoneIdx := 0
 	var brief research.Brief
 	briefFetched := false
-	select {
-	case brief = <-researchCh:
-		briefFetched = true
-		printBrief(brief)
-	default:
-		fmt.Println("  ⟳  Researching " + co.Name + "...")
-		fmt.Println("     (press ENTER to check again or go straight to call)")
-	}
-	fmt.Println("  ────────────────────────────────────────────────────")
 
-	// Action prompt
-	extra := ""
-	if len(co.Contacts) > 1 {
-		extra = "    n  Next contact"
+	// selectedPhone returns the number/type the SDR currently has highlighted.
+	selectedPhone := func() (string, string) {
+		phones := leads.PhonesFor(co.Contacts[contactIdx])
+		if len(phones) == 0 {
+			return "", "none"
+		}
+		if phoneIdx >= len(phones) {
+			phoneIdx = 0
+		}
+		return phones[phoneIdx].Number, phones[phoneIdx].Label
 	}
-	back := ""
-	if hasPrevious {
-		back = "    b  Back"
+
+	// render draws the full card for the current contact + phone selection.
+	// A fresh card is printed below the previous one (no clear — SDR can scroll up).
+	render := func() {
+		fmt.Print("\n\n")
+		fmt.Println(barSep)
+		fmt.Printf("  %s  ·  %d / %d\n", csvDisplayName, position, total)
+		fmt.Printf("  %s\n", session.RenderProgressBar(position, total, 30))
+		fmt.Println(barSep)
+
+		fmt.Printf("\n  COMPANY   %s\n", co.Name)
+		var parts []string
+		if co.City != "" {
+			parts = append(parts, co.City)
+		}
+		if co.Province != "" {
+			parts = append(parts, co.Province)
+		}
+		if co.Employees != "" {
+			parts = append(parts, co.Employees+" employees")
+		}
+		if co.Industry != "" {
+			parts = append(parts, co.Industry)
+		}
+		if len(parts) > 0 {
+			fmt.Printf("            %s\n", strings.Join(parts, " · "))
+		}
+		if co.Website != "" {
+			fmt.Printf("  WEBSITE   %s\n", websiteLink(co.Website))
+		}
+
+		// Contacts roster — finance-first order, selected one marked with ›.
+		if len(co.Contacts) > 1 {
+			fmt.Println("\n  ─ CONTACTS ─────────────────────────────────────────")
+			for i, c := range co.Contacts {
+				marker := " "
+				if i == contactIdx {
+					marker = "›"
+				}
+				name := strings.TrimSpace(c.FirstName + " " + c.LastName)
+				title := c.Title
+				if title == "" {
+					title = "—"
+				}
+				fmt.Printf("  %s %d. %s — %s  (%s)\n", marker, i+1, name, title, phoneSummary(c))
+			}
+		}
+
+		// Selected contact detail + the number that will be dialed.
+		contact := co.Contacts[contactIdx]
+		phone, phoneLabel := selectedPhone()
+		if phone == "" {
+			phone = "—"
+		}
+		numHint := ""
+		if n := len(leads.PhonesFor(contact)); n > 1 {
+			numHint = fmt.Sprintf("   [m to switch · %d/%d]", phoneIdx+1, n)
+		}
+		fmt.Printf("\n  CONTACT   %s %s — %s\n", contact.FirstName, contact.LastName, contact.Title)
+		fmt.Printf("  PHONE     %s  (%s)%s\n", phone, phoneLabel, numHint)
+		if contact.Email != "" {
+			fmt.Printf("  EMAIL     %s\n", contact.Email)
+		}
+
+		// Research section — show immediately if prefetch already landed.
+		fmt.Println("\n  ─ RESEARCH ────────────────────────────────────────")
+		if briefFetched {
+			printBrief(brief)
+		} else {
+			select {
+			case brief = <-researchCh:
+				briefFetched = true
+				printBrief(brief)
+			default:
+				fmt.Println("  ⟳  Researching " + co.Name + "...")
+				fmt.Println("     (press ENTER to check again or go straight to call)")
+			}
+		}
+		fmt.Println("  ────────────────────────────────────────────────────")
 	}
+
 	printPrompt := func() {
-		fmt.Printf("\n  c  Call    s  Skip%s%s    q  Quit\n\n  Press a key:\n> ", extra, back)
+		nav := ""
+		if len(co.Contacts) > 1 {
+			nav = "    n  Next contact    p  Prev"
+		}
+		num := ""
+		if len(leads.PhonesFor(co.Contacts[contactIdx])) > 1 {
+			num = "    m  Number"
+		}
+		back := ""
+		if hasPrevious {
+			back = "    b  Back"
+		}
+		fmt.Printf("\n  c  Call    s  Skip%s%s%s    q  Quit\n\n  Press a key:\n> ", nav, num, back)
 	}
+
+	render()
 	printPrompt()
 
 	for {
@@ -203,6 +267,7 @@ func RunCard(
 					}
 				}
 			}
+			phone, phoneLabel := selectedPhone()
 			result, _, aborted := doCall(phone, co, brief, cfg, noAircall)
 			if aborted {
 				fmt.Println("\n  ← Call cancelled.")
@@ -210,6 +275,8 @@ func RunCard(
 				continue
 			}
 			result.Brief = brief
+			result.DialedPhone = phone
+			result.DialedPhoneLabel = phoneLabel
 			return result, contactIdx
 
 		case 's', 'S':
@@ -224,15 +291,25 @@ func RunCard(
 
 		case 'n', 'N':
 			if len(co.Contacts) > 1 {
-				next := (contactIdx + 1) % len(co.Contacts)
-				var ch chan research.Brief
-				if briefFetched {
-					ch = make(chan research.Brief, 1)
-					ch <- brief
-				} else {
-					ch = researchCh
-				}
-				return RunCard(co, next, position, total, csvDisplayName, ch, hasPrevious, cfg, noAircall)
+				contactIdx = (contactIdx + 1) % len(co.Contacts)
+				phoneIdx = 0
+				render()
+				printPrompt()
+			}
+
+		case 'p', 'P':
+			if len(co.Contacts) > 1 {
+				contactIdx = (contactIdx - 1 + len(co.Contacts)) % len(co.Contacts)
+				phoneIdx = 0
+				render()
+				printPrompt()
+			}
+
+		case 'm', 'M':
+			if n := len(leads.PhonesFor(co.Contacts[contactIdx])); n > 1 {
+				phoneIdx = (phoneIdx + 1) % n
+				render()
+				printPrompt()
 			}
 
 		case 'q', 'Q', 3:
