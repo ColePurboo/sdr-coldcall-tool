@@ -76,7 +76,9 @@ Rate-limit handling: reads Anthropic 429 `retry-after` headers and backs off wit
 
 ## Dialer call flow
 
-The company card shows a **CONTACTS roster** (all contacts at the company, each with title and available number-type tags) plus the selected contact's dialable number. Contacts are ordered **finance-first, then executives, then the rest** (`leads.SortContacts`), so the top finance DM is selected by default.
+The company card shows a **CONTACTS roster** (all contacts at the company, each with title and available number-type tags) plus the selected contact's dialable number. Contacts are ordered by `leads.SortContacts` into: **senior finance / CFO → other finance → executives → the rest**, so the top finance DM is selected by default.
+
+For HubSpot lists, `hubspot.LoadContacts` groups by `associatedcompanyid` and then **pulls in every contact associated with that HubSpot company** (v4 associations + v3 batch read, `expandAssociatedContacts`), not just the list members — so the SDR can cycle through everyone at the account even if only one contact was assigned. Expansion runs with bounded concurrency and degrades gracefully (a company keeps its list contacts if its association lookup fails).
 
 Navigation keys on the card:
 - `n` / `p` — scroll to the next / previous contact (resets the number selection)

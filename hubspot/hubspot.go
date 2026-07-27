@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -141,6 +142,7 @@ func LoadContacts(token string, listID int) ([]*leads.Company, error) {
 
 	companyMap := make(map[string]*leads.Company)
 	var order []string
+	loaded := make(map[string]bool) // contact ids already added (dedup across list + associations)
 
 	vidOffset := 0
 	for {
@@ -213,27 +215,9 @@ func LoadContacts(token string, listID int) ([]*leads.Company, error) {
 				order = append(order, key)
 			}
 
-			// Build the tagged phone list from every discovered phone property.
-			var phones []leads.Phone
-			for _, pp := range phoneProps {
-				phones = append(phones, leads.Phone{
-					Number: normalizePhone(prop(pp.Name)),
-					Label:  pp.Label,
-				})
-			}
-			phones = leads.DedupePhones(phones)
-
-			contact := leads.Contact{
-				FirstName:    firstName,
-				LastName:     lastName,
-				Title:        prop("jobtitle"),
-				Email:        prop("email"),
-				CompanyPhone: normalizePhone(prop("phone")),
-				MobilePhone:  normalizePhone(prop("mobilephone")),
-				Phones:       phones,
-				HubSpotID:    fmt.Sprintf("%d", c.VID),
-			}
-			co.Contacts = append(co.Contacts, contact)
+			id := fmt.Sprintf("%d", c.VID)
+			co.Contacts = append(co.Contacts, buildContact(id, prop, phoneProps))
+			loaded[id] = true
 		}
 
 		if !resp.HasMore {
@@ -241,6 +225,11 @@ func LoadContacts(token string, listID int) ([]*leads.Company, error) {
 		}
 		vidOffset = resp.VidOffset
 	}
+
+	// For every company grouped by a HubSpot company object, pull in ALL contacts
+	// associated with that company — not just the ones that happened to be in the
+	// assigned list — so the SDR can cycle through everyone at the account.
+	expandAssociatedContacts(token, companyMap, order, loaded, properties, phoneProps)
 
 	// Sort each company's contacts finance-first and treat the top one as primary.
 	companies := make([]*leads.Company, 0, len(order))
@@ -252,6 +241,186 @@ func LoadContacts(token string, listID int) ([]*leads.Company, error) {
 	}
 
 	return companies, nil
+}
+
+// buildContact assembles a leads.Contact from a property accessor, building the
+// tagged phone list from every discovered phone property.
+func buildContact(id string, prop func(string) string, phoneProps []phoneProp) leads.Contact {
+	var phones []leads.Phone
+	for _, pp := range phoneProps {
+		phones = append(phones, leads.Phone{
+			Number: normalizePhone(prop(pp.Name)),
+			Label:  pp.Label,
+		})
+	}
+	phones = leads.DedupePhones(phones)
+
+	return leads.Contact{
+		FirstName:    prop("firstname"),
+		LastName:     prop("lastname"),
+		Title:        prop("jobtitle"),
+		Email:        prop("email"),
+		CompanyPhone: normalizePhone(prop("phone")),
+		MobilePhone:  normalizePhone(prop("mobilephone")),
+		Phones:       phones,
+		HubSpotID:    id,
+	}
+}
+
+// maxAssociatedPerCompany caps how many associated contacts we pull per company,
+// as a guard against unusually large accounts.
+const maxAssociatedPerCompany = 200
+
+// expandAssociatedContacts fetches every contact associated with each company
+// grouped by HubSpot company id and merges in any not already loaded. Failures
+// for a single company are non-fatal — that company simply keeps its list
+// contacts. Runs companies concurrently (bounded) to keep loading responsive.
+func expandAssociatedContacts(
+	token string,
+	companyMap map[string]*leads.Company,
+	order []string,
+	loaded map[string]bool,
+	properties []string,
+	phoneProps []phoneProp,
+) {
+	// Collect the company ids to expand (those grouped by a HubSpot company).
+	var ids []string
+	for _, key := range order {
+		if strings.HasPrefix(key, "id:") {
+			ids = append(ids, strings.TrimPrefix(key, "id:"))
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	fmt.Printf("\r  Expanding contacts across %d companies...", len(ids))
+
+	type result struct {
+		key      string
+		contacts []leads.Contact
+	}
+
+	sem := make(chan struct{}, 6) // bounded concurrency
+	results := make(chan result, len(ids))
+	var wg sync.WaitGroup
+
+	for _, companyID := range ids {
+		wg.Add(1)
+		go func(companyID string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			contactIDs, err := fetchAssociatedContactIDs(token, companyID)
+			if err != nil {
+				return
+			}
+			contacts, err := batchReadContacts(token, contactIDs, properties, phoneProps)
+			if err != nil {
+				return
+			}
+			results <- result{key: "id:" + companyID, contacts: contacts}
+		}(companyID)
+	}
+
+	go func() { wg.Wait(); close(results) }()
+
+	// Merge sequentially so the shared `loaded` set and slices stay race-free.
+	for r := range results {
+		co := companyMap[r.key]
+		if co == nil {
+			continue
+		}
+		for _, c := range r.contacts {
+			if c.HubSpotID == "" || loaded[c.HubSpotID] {
+				continue
+			}
+			loaded[c.HubSpotID] = true
+			co.Contacts = append(co.Contacts, c)
+		}
+	}
+	fmt.Print("\r\033[K") // clear the progress line
+}
+
+// fetchAssociatedContactIDs returns the ids of all contacts associated with a
+// HubSpot company, paginating up to maxAssociatedPerCompany.
+func fetchAssociatedContactIDs(token, companyID string) ([]string, error) {
+	var ids []string
+	after := ""
+	for len(ids) < maxAssociatedPerCompany {
+		url := fmt.Sprintf("%s/crm/v4/objects/companies/%s/associations/contacts?limit=100", baseURL, companyID)
+		if after != "" {
+			url += "&after=" + after
+		}
+		body, err := get(token, url)
+		if err != nil {
+			return nil, err
+		}
+		var resp struct {
+			Results []struct {
+				ToObjectID json.Number `json:"toObjectId"`
+			} `json:"results"`
+			Paging struct {
+				Next struct {
+					After string `json:"after"`
+				} `json:"next"`
+			} `json:"paging"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, fmt.Errorf("parse associations: %w", err)
+		}
+		for _, r := range resp.Results {
+			ids = append(ids, r.ToObjectID.String())
+		}
+		if resp.Paging.Next.After == "" {
+			break
+		}
+		after = resp.Paging.Next.After
+	}
+	return ids, nil
+}
+
+// batchReadContacts reads the given contacts (in chunks of 100) via the v3 batch
+// API and returns them as leads.Contact values.
+func batchReadContacts(token string, ids []string, properties []string, phoneProps []phoneProp) ([]leads.Contact, error) {
+	var out []leads.Contact
+	for start := 0; start < len(ids); start += 100 {
+		end := start + 100
+		if end > len(ids) {
+			end = len(ids)
+		}
+		inputs := make([]map[string]string, 0, end-start)
+		for _, id := range ids[start:end] {
+			inputs = append(inputs, map[string]string{"id": id})
+		}
+		reqBody, err := json.Marshal(map[string]any{
+			"properties": properties,
+			"inputs":     inputs,
+		})
+		if err != nil {
+			return nil, err
+		}
+		body, err := post(token, baseURL+"/crm/v3/objects/contacts/batch/read", reqBody)
+		if err != nil {
+			return nil, err
+		}
+		var resp struct {
+			Results []struct {
+				ID         string            `json:"id"`
+				Properties map[string]string `json:"properties"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, fmt.Errorf("parse batch read: %w", err)
+		}
+		for _, r := range resp.Results {
+			props := r.Properties
+			prop := func(key string) string { return strings.TrimSpace(props[key]) }
+			out = append(out, buildContact(r.ID, prop, phoneProps))
+		}
+	}
+	return out, nil
 }
 
 // WriteCallEngagement creates a call engagement in HubSpot and associates it
