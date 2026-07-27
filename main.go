@@ -291,12 +291,14 @@ func runLoop(
 			continue
 		}
 
-		// Build and write local log entry.
+		// Build and write local log entry. Log the number the SDR actually
+		// dialed (their selection), not the mobile-first default.
 		dialedContact := co.Contacts[contactIdx]
 		entry := logger.BuildEntry(
 			co,
 			dialedContact,
-			leads.BestPhone(dialedContact),
+			result.DialedPhone,
+			result.DialedPhoneLabel,
 			result.Disposition,
 			result.Sentiment,
 			result.FreeText,

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -109,10 +110,32 @@ func FetchLists(token string) ([]HSList, error) {
 // LoadContacts fetches all contacts from a HubSpot list and groups them by company,
 // mirroring the CSV loader's behaviour. Primary contact is chosen by title tier.
 func LoadContacts(token string, listID int) ([]*leads.Company, error) {
-	properties := []string{
-		"firstname", "lastname", "jobtitle", "email",
-		"phone", "mobilephone", "company",
+	// Discover every phone-number property (including custom fields) so all of a
+	// contact's numbers can be surfaced and tagged. Fall back to the two standard
+	// fields if discovery isn't available (e.g. missing properties scope).
+	phoneProps, err := fetchPhoneProperties(token)
+	if err != nil || len(phoneProps) == 0 {
+		phoneProps = standardPhoneProps()
+	}
+
+	baseProps := []string{
+		"firstname", "lastname", "jobtitle", "email", "company", "associatedcompanyid",
 		"city", "state", "industry", "website", "numberofemployees",
+	}
+	propSet := make(map[string]bool)
+	var properties []string
+	addProp := func(n string) {
+		if n == "" || propSet[n] {
+			return
+		}
+		propSet[n] = true
+		properties = append(properties, n)
+	}
+	for _, p := range baseProps {
+		addProp(p)
+	}
+	for _, p := range phoneProps {
+		addProp(p.Name)
 	}
 	propQuery := "&property=" + strings.Join(properties, "&property=")
 
@@ -153,6 +176,7 @@ func LoadContacts(token string, listID int) ([]*leads.Company, error) {
 				return strings.TrimSpace(c.Properties[key].Value)
 			}
 
+			companyID := prop("associatedcompanyid")
 			companyName := prop("company")
 			firstName := prop("firstname")
 			lastName := prop("lastname")
@@ -160,11 +184,16 @@ func LoadContacts(token string, listID int) ([]*leads.Company, error) {
 				// Fall back to contact's full name as company key
 				companyName = strings.TrimSpace(firstName + " " + lastName)
 			}
-			if companyName == "" {
+			if companyName == "" && companyID == "" {
 				continue
 			}
 
+			// Group by the HubSpot company object when available (reliably keeps
+			// the CEO + CFO of the same company together), else by company name.
 			key := normalizeKey(companyName)
+			if companyID != "" {
+				key = "id:" + companyID
+			}
 			co, exists := companyMap[key]
 			if !exists {
 				website := prop("website")
@@ -184,6 +213,16 @@ func LoadContacts(token string, listID int) ([]*leads.Company, error) {
 				order = append(order, key)
 			}
 
+			// Build the tagged phone list from every discovered phone property.
+			var phones []leads.Phone
+			for _, pp := range phoneProps {
+				phones = append(phones, leads.Phone{
+					Number: normalizePhone(prop(pp.Name)),
+					Label:  pp.Label,
+				})
+			}
+			phones = leads.DedupePhones(phones)
+
 			contact := leads.Contact{
 				FirstName:    firstName,
 				LastName:     lastName,
@@ -191,6 +230,7 @@ func LoadContacts(token string, listID int) ([]*leads.Company, error) {
 				Email:        prop("email"),
 				CompanyPhone: normalizePhone(prop("phone")),
 				MobilePhone:  normalizePhone(prop("mobilephone")),
+				Phones:       phones,
 				HubSpotID:    fmt.Sprintf("%d", c.VID),
 			}
 			co.Contacts = append(co.Contacts, contact)
@@ -202,19 +242,12 @@ func LoadContacts(token string, listID int) ([]*leads.Company, error) {
 		vidOffset = resp.VidOffset
 	}
 
-	// Resolve primary contact per company (highest title tier = lowest tier number).
+	// Sort each company's contacts finance-first and treat the top one as primary.
 	companies := make([]*leads.Company, 0, len(order))
 	for _, key := range order {
 		co := companyMap[key]
-		best := co.Contacts[0]
-		bestTier := titleTier(best.Title)
-		for _, c := range co.Contacts[1:] {
-			if t := titleTier(c.Title); t < bestTier {
-				best = c
-				bestTier = t
-			}
-		}
-		co.Primary = best
+		leads.SortContacts(co.Contacts)
+		co.Primary = co.Contacts[0]
 		companies = append(companies, co)
 	}
 
@@ -388,34 +421,106 @@ func normalizeKey(name string) string {
 	return strings.TrimSpace(b.String())
 }
 
-// titleTier returns 1 (highest) through 5 (lowest) priority for a job title.
-func titleTier(title string) int {
-	t := strings.ToLower(title)
-	tier1 := []string{"ceo", "president", "owner", "founder", "co-founder", "co founder"}
-	tier2 := []string{"coo", "cfo", "cto", "vp ", "vice president", "director"}
-	tier3 := []string{"controller", "manager", "gm", "general manager"}
-	tier4 := []string{"accountant", "bookkeeper", "finance", "operations", "accounting"}
-	for _, kw := range tier1 {
-		if strings.Contains(t, kw) {
-			return 1
+// phoneProp is a discovered HubSpot contact property that holds a phone number.
+type phoneProp struct {
+	Name  string // internal property name to request
+	Label string // friendly tag shown to the SDR ("mobile", "office", or the HubSpot label)
+	rank  int    // sort order: mobile (0), office (1), everything else (2)
+}
+
+// phoneNameHints are substrings that mark a property as a phone number when the
+// HubSpot fieldType isn't explicitly "phonenumber".
+var phoneNameHints = []string{"phone", "mobile", "cell", "direct", "tel"}
+
+// isPhoneProperty reports whether a contact property holds a phone number, based
+// on its HubSpot field type, internal name, or label.
+func isPhoneProperty(name, fieldType, label string) bool {
+	if fieldType == "phonenumber" {
+		return true
+	}
+	hay := strings.ToLower(name + " " + label)
+	for _, kw := range phoneNameHints {
+		if strings.Contains(hay, kw) {
+			return true
 		}
 	}
-	for _, kw := range tier2 {
-		if strings.Contains(t, kw) {
-			return 2
-		}
+	return false
+}
+
+// phoneLabelFor returns the friendly tag for a phone property.
+func phoneLabelFor(name, label string) string {
+	switch name {
+	case "mobilephone":
+		return "mobile"
+	case "phone":
+		return "office"
 	}
-	for _, kw := range tier3 {
-		if strings.Contains(t, kw) {
-			return 3
-		}
+	if label != "" {
+		return label
 	}
-	for _, kw := range tier4 {
-		if strings.Contains(t, kw) {
-			return 4
-		}
+	return name
+}
+
+// phoneRank orders phone properties: mobile first, the standard office phone
+// next, then all custom fields.
+func phoneRank(name string) int {
+	switch name {
+	case "mobilephone":
+		return 0
+	case "phone":
+		return 1
 	}
-	return 5
+	n := strings.ToLower(name)
+	if strings.Contains(n, "mobile") || strings.Contains(n, "cell") {
+		return 0
+	}
+	return 2
+}
+
+// standardPhoneProps is the fallback set used when property discovery is
+// unavailable (e.g. missing scope) — the two standard HubSpot phone fields.
+func standardPhoneProps() []phoneProp {
+	return []phoneProp{
+		{Name: "mobilephone", Label: "mobile", rank: 0},
+		{Name: "phone", Label: "office", rank: 1},
+	}
+}
+
+// fetchPhoneProperties discovers every phone-number contact property in the
+// portal (including custom fields) so their numbers can be surfaced and tagged.
+func fetchPhoneProperties(token string) ([]phoneProp, error) {
+	body, err := get(token, baseURL+"/crm/v3/properties/contacts")
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Results []struct {
+			Name      string `json:"name"`
+			Label     string `json:"label"`
+			FieldType string `json:"fieldType"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse contact properties: %w", err)
+	}
+	var props []phoneProp
+	for _, p := range resp.Results {
+		if !isPhoneProperty(p.Name, p.FieldType, p.Label) {
+			continue
+		}
+		props = append(props, phoneProp{
+			Name:  p.Name,
+			Label: phoneLabelFor(p.Name, p.Label),
+			rank:  phoneRank(p.Name),
+		})
+	}
+	sort.SliceStable(props, func(i, j int) bool {
+		if props[i].rank != props[j].rank {
+			return props[i].rank < props[j].rank
+		}
+		return props[i].Name < props[j].Name
+	})
+	return props, nil
 }
 
 // normalizePhone converts a raw phone string to E.164 format (best-effort).

@@ -147,7 +147,7 @@ func (l *Logger) flush() error {
 func BuildEntry(
 	co *leads.Company,
 	contact leads.Contact,
-	phone string,
+	phone, phoneLabel string,
 	disposition, sentiment, freeText string,
 	brief research.Brief,
 	callStart, callEnd time.Time,
@@ -167,6 +167,13 @@ func BuildEntry(
 	bodyParts = append(bodyParts, "Disposition: "+dispLabel)
 	if sentLabel != "" {
 		bodyParts = append(bodyParts, "Sentiment: "+sentLabel)
+	}
+	if phone != "" {
+		num := phone
+		if phoneLabel != "" && phoneLabel != "none" {
+			num += " (" + phoneLabel + ")"
+		}
+		bodyParts = append(bodyParts, "Number dialed: "+num)
 	}
 	if freeText != "" {
 		bodyParts = append(bodyParts, "Notes: "+freeText)
